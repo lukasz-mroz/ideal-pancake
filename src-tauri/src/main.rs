@@ -96,10 +96,18 @@ async fn main() {
         builder = builder.plugin(tauri_plugin_localhost::Builder::new(port).build());
     }
 
+    // Release builds have no console, so also write logs to a file: next to
+    // the executable when portable, otherwise the OS log directory.
+    let mut log_targets = vec![LogTarget::Stdout, LogTarget::Webview];
+    match configuration::portable::logs_dir() {
+        Some(dir) => log_targets.push(LogTarget::Folder(dir)),
+        None => log_targets.push(LogTarget::LogDir),
+    }
+
     builder
         .plugin(
             tauri_plugin_log::Builder::default()
-                .targets([LogTarget::Stdout, LogTarget::Webview])
+                .targets(log_targets)
                 .level_for("hnsw_rs", log::LevelFilter::Warn)
                 .level_for("html5ever", log::LevelFilter::Warn)
                 .level_for("selectors", log::LevelFilter::Warn)

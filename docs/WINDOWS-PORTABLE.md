@@ -39,6 +39,52 @@ scripts\package-portable.ps1 -WhisperModel none -IncludeWebView2:$false
 scripts\package-portable.ps1 -NoZip
 ```
 
+## GPU transcription (NVIDIA / CUDA)
+
+Local Whisper runs on the CPU on Windows. Building with the `cuda` feature
+moves it onto an NVIDIA GPU instead:
+
+```powershell
+scripts\build-portable-cuda.cmd
+```
+
+That needs the CUDA Toolkit (`winget install Nvidia.CUDA`) on the build
+machine; the packaged folder carries the CUDA runtime DLLs, so the machine
+that *runs* it needs only an NVIDIA driver. The output goes to
+`dist-portable-cuda\`, leaving any CPU build in `dist-portable\` untouched so
+the two can be compared on the same recording.
+
+The *Windows portable build (CUDA)* workflow does the same thing in CI, for
+when you would rather not install the toolkit locally. The runner has no GPU,
+so it only proves the build compiles.
+
+On the machine that runs the CUDA build, the DLLs can also be fetched
+separately instead of riding inside the package:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\fetch-cuda-runtime.ps1 -Destination <portable folder>
+```
+
+It pulls cudart and cuBLAS from NVIDIA's redistributable packages (published
+on PyPI as plain zip archives - no Python needed) and drops the DLLs next to
+`Platypus.exe`. This does not turn a CPU build into a GPU build: the CUDA
+backend is compiled into the executable.
+
+VRAM is the practical limit: `large-v3` in fp16 needs about 3.1 GB, which is
+tight on a 4 GB card that is also driving the desktop. `large-v3-turbo`
+(~1.6 GB) is the safe default there.
+
+## Helper scripts inside the package
+
+Every package carries two small scripts, run from the unpacked folder:
+
+- `fetch-whisper-model.ps1` - downloads a Whisper model into `data\models`,
+  with resume support. Useful when the package was built with
+  `whisper_model: none`, which keeps the download off the build and onto the
+  machine that will actually transcribe.
+- `fetch-cuda-runtime.ps1` - pulls the CUDA runtime DLLs for a GPU build that
+  was packaged without them.
+
 ## What the package contains
 
 ```

@@ -34,6 +34,10 @@ param(
     # Compiled binary; defaults to the cargo release output.
     [string]$ExePath = 'src-tauri\target\release\platypus_notes.exe',
 
+    # Copy the CUDA runtime DLLs next to the executable (for builds made with
+    # the `cuda` cargo feature).
+    [switch]$IncludeCudaRuntime,
+
     # Skip creating the .zip (folder only).
     [switch]$NoZip
 )
@@ -63,6 +67,32 @@ try {
     # Only needed on older toolchains; harmless to carry along when present.
     $loader = Join-Path (Split-Path -Parent $ExePath) 'WebView2Loader.dll'
     if (Test-Path $loader) { Copy-Item $loader $stage -Force }
+
+    # ------------------------------------------------------------ CUDA runtime
+    if ($IncludeCudaRuntime) {
+        if (-not $env:CUDA_PATH) {
+            throw 'CUDA runtime requested but CUDA_PATH is not set. Install the CUDA Toolkit and reopen the shell.'
+        }
+        $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+        if (-not (Test-Path $cudaBin)) { throw "CUDA bin folder not found: $cudaBin" }
+
+        $copied = 0
+        foreach ($pattern in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
+            foreach ($dll in Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue) {
+                Copy-Item $dll.FullName $stage -Force
+                $copied++
+            }
+        }
+        if ($copied -eq 0) { throw "No CUDA runtime DLLs found in $cudaBin" }
+        Write-Host "    CUDA runtime: $copied DLL(s) from $cudaBin"
+    }
+
+    # Helper scripts the target machine may need: pulling a Whisper model, and
+    # the CUDA runtime DLLs for a GPU build that was packaged without them.
+    foreach ($helper in 'fetch-whisper-model.ps1', 'fetch-cuda-runtime.ps1') {
+        $source = Join-Path $PSScriptRoot $helper
+        if (Test-Path $source) { Copy-Item $source $stage -Force }
+    }
 
     # Marker file: makes the build portable even if it was compiled without
     # the `portable` cargo feature. Delete it to fall back to %APPDATA%.
@@ -161,11 +191,18 @@ machine, copy the whole folder. To reset the app, delete the data folder.
 Want the classic behaviour (data in %APPDATA%)? Delete portable.txt and set
 the environment variable PLATYPUS_PORTABLE=0.
 
-Offline use
------------
-A Whisper model ships in data\models, so local transcription works without
-internet. Chatting with your notes still needs whichever LLM you connect
-(or a local Ollama model, which works fully offline).
+Whisper model
+-------------
+If data\models is empty, the app downloads the model the first time you
+transcribe something. To do it up front (and with resume support):
+
+  powershell -ExecutionPolicy Bypass -File fetch-whisper-model.ps1
+
+Add -Model large-v3-turbo for the smaller, faster one. Whatever you pick here
+must match the model selected in Settings.
+
+Chatting with your notes still needs whichever LLM you connect - a local
+Ollama model keeps the whole thing offline.
 
 Version: $version
 "@

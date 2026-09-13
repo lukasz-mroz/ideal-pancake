@@ -129,3 +129,9 @@ pub fn prepare_environment() {
         }
     }
 }
+
+/// Where log files are written. Portable builds keep them next to the
+/// executable; otherwise the plugin's OS-specific log directory is used.
+pub fn logs_dir() -> Option<PathBuf> {
+    portable_root().map(|root| root.join("logs"))
+}

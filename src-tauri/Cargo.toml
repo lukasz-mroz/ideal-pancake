@@ -86,6 +86,11 @@ custom-protocol = ["tauri/custom-protocol"]
 # `src/configuration/portable.rs`.
 portable = []
 
+# GPU transcription on Windows via whisper.cpp's CUDA backend. Requires the
+# CUDA Toolkit (nvcc) at build time and the CUDA runtime DLLs next to the
+# executable at run time - see scripts/package-portable.ps1 -IncludeCudaRuntime.
+cuda = ["whisper-rs/cuda"]
+
 [target."cfg(not(target_os = \"windows\"))".dependencies]
 strip-ansi-escapes = "0.2"
 

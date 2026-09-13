@@ -1,10 +1,11 @@
-name: Windows portable build
+name: Windows portable build (CUDA)
 
-# Builds Platypus as a portable Windows app: a folder you unzip and run, with
-# every bit of user data kept next to the executable (see
-# src-tauri/src/configuration/portable.rs).
+# Same portable package as windows-portable.yml, but with whisper.cpp built
+# against CUDA, so transcription runs on an NVIDIA GPU. The runner has no GPU -
+# it only compiles - so the result can only be verified on a machine with one.
 #
-# Run it from the Actions tab ("Run workflow"), or push a tag like v0.1.0.
+# The package carries the CUDA runtime DLLs, so the target machine needs an
+# NVIDIA driver but not the CUDA Toolkit.
 
 on:
   workflow_dispatch:
@@ -22,9 +23,6 @@ on:
         description: Bundle the WebView2 runtime installer (works without internet)
         type: boolean
         default: true
-  push:
-    tags:
-      - 'v*'
 
 jobs:
   build:
@@ -49,6 +47,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          key: cuda
+
+      # Installs nvcc and the cuBLAS headers the whisper.cpp CUDA backend needs.
+      # If the build fails on a missing CUDA component, widen sub-packages or
+      # switch to method: 'local' (downloads the full ~3 GB installer).
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.5.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
 
       # whisper-rs-sys compiles whisper.cpp with cmake and generates bindings
       # with bindgen, which needs libclang.dll. Both ship with the runner
@@ -83,15 +92,16 @@ jobs:
       # Build the binary with cargo directly (no tauri CLI): the `portable`
       # feature pins all data next to the executable, `custom-protocol` embeds
       # the frontend from ../dist.
-      - name: Build Platypus (release, portable)
-        run: cargo build --release --features "custom-protocol portable" --manifest-path src-tauri/Cargo.toml
+      - name: Build Platypus (release, portable, CUDA)
+        run: cargo build --release --features "custom-protocol portable cuda" --manifest-path src-tauri/Cargo.toml
 
       - name: Package portable bundle
         shell: pwsh
         run: |
           ./scripts/package-portable.ps1 `
             -WhisperModel "$env:WHISPER_MODEL" `
-            -IncludeWebView2 ([System.Convert]::ToBoolean("$env:INCLUDE_WEBVIEW2"))
+            -IncludeWebView2 ([System.Convert]::ToBoolean("$env:INCLUDE_WEBVIEW2")) `
+            -IncludeCudaRuntime
 
       - name: Show package contents
         shell: pwsh
@@ -101,14 +111,7 @@ jobs:
       # model does not compress further.
       - uses: actions/upload-artifact@v4
         with:
-          name: platypus-portable-windows-x64
+          name: platypus-portable-windows-x64-cuda
           path: dist-portable/*.zip
           compression-level: 0
           retention-days: 14
-
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist-portable/*.zip
-          fail_on_unmatched_files: false
