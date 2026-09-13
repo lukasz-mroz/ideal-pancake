@@ -265,6 +265,21 @@ async fn main() {
                 .unwrap_or_default();
             engine::whisper_engine::set_language(&language);
 
+            let separate = app_handle
+                .db(|db| get_setting(db, "separate_speaker_streams"))
+                .map(|setting| setting.setting_value)
+                .unwrap_or_default();
+            if !separate.trim().is_empty() {
+                SEPARATE_SPEAKERS.store(
+                    separate.eq_ignore_ascii_case("true"),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            info!(
+                "Per-speaker transcription: {}",
+                SEPARATE_SPEAKERS.load(std::sync::atomic::Ordering::SeqCst)
+            );
+
             // System audio capture is read once at startup; changing it takes
             // effect on the next run.
             let capture_system_audio = app_handle
@@ -313,7 +328,7 @@ fn setup_keypress_listener(app_handle: &AppHandle) {
 /// runs. Only missing keys are written - anything the user has already chosen
 /// is left alone.
 fn seed_default_settings(app_handle: &AppHandle) {
-    const DEFAULTS: [(&str, &str); 8] = [
+    const DEFAULTS: [(&str, &str); 9] = [
         // Transcribe on this machine: an unattended capture cannot depend on
         // an API key being present.
         ("use_local_transcription", "true"),
@@ -326,6 +341,10 @@ fn seed_default_settings(app_handle: &AppHandle) {
         // "auto" detects per chunk; set a code like "pl" when you know what
         // will be spoken - detection costs accuracy on short chunks.
         ("transcription_language", "auto"),
+        // Pull decisions and action items out of each meeting afterwards.
+        // "local" uses Ollama and keeps everything on this machine; "claude",
+        // "openai" and "gemini" are better at it; "off" disables the pass.
+        ("post_meeting_analysis", "local"),
         ("vectorization_enabled", "true"),
         // 20 chunks of 4000 characters is ~25k tokens per question, which
         // overflows a local model's context and dilutes retrieval for a
@@ -895,6 +914,15 @@ async fn start_audio_recording(app_handle: AppHandle, use_local: bool) -> Result
             let mut t = ACCUMULATED_TRANSCRIPT.lock().unwrap();
             t.clear();
         }
+        {
+            let mut last = LAST_SPEAKER.lock().unwrap();
+            *last = None;
+        }
+        {
+            // A recording started by hand has no meeting context to name.
+            let mut label = OTHERS_LABEL.lock().unwrap();
+            *label = "Others".to_string();
+        }
         // Spawn the realtime transcription loop
         let handle = app_handle.clone();
         tokio::spawn(async move {
@@ -917,10 +945,7 @@ async fn stop_audio_recording(app_handle: AppHandle, use_local: bool) -> Result<
         if !remaining.is_empty() {
             if let Some(text) = process_and_transcribe_chunk(&remaining) {
                 let mut t = ACCUMULATED_TRANSCRIPT.lock().unwrap();
-                if !t.is_empty() {
-                    t.push(' ');
-                }
-                t.push_str(&text);
+                append_with_speaker(&mut t, &text);
             }
         }
         // Emit final transcript
@@ -955,6 +980,21 @@ lazy_static! {
     /// (source app, start time) of the recording in progress, if any.
     static ref AUTO_RECORD_META: Arc<std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Local>)>>> =
         Arc::new(std::sync::Mutex::new(None));
+
+    /// Speaker label used for the previous piece of transcript, so a new
+    /// heading is only written when the side actually changes.
+    static ref LAST_SPEAKER: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    /// What to call the far end of the call. A name when a one-to-one call
+    /// gave us one, "Others" otherwise.
+    static ref OTHERS_LABEL: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new("Others".to_string()));
+
+    /// Timed utterances of the recording in progress, for the JSON companion
+    /// to the transcript.
+    static ref AUTO_UTTERANCES: Arc<std::sync::Mutex<Vec<engine::transcript_export::Utterance>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
 }
 
 /// Capture meetings without asking. Defaults to on: a build that runs hidden
@@ -971,7 +1011,11 @@ pub(crate) fn auto_capture_enabled(app_handle: &AppHandle) -> bool {
     }
 }
 
-pub(crate) fn auto_record_start(app_handle: AppHandle, app_name: String) {
+pub(crate) fn auto_record_start(
+    app_handle: AppHandle,
+    app_name: String,
+    other_party: Option<String>,
+) {
     tauri::async_runtime::spawn(async move {
         use std::sync::atomic::Ordering;
 
@@ -989,6 +1033,21 @@ pub(crate) fn auto_record_start(app_handle: AppHandle, app_name: String) {
         {
             let mut transcript = ACCUMULATED_TRANSCRIPT.lock().unwrap();
             transcript.clear();
+        }
+        {
+            let mut last = LAST_SPEAKER.lock().unwrap();
+            *last = None;
+        }
+        {
+            let mut utterances = AUTO_UTTERANCES.lock().unwrap();
+            utterances.clear();
+        }
+        {
+            let mut label = OTHERS_LABEL.lock().unwrap();
+            *label = other_party.clone().unwrap_or_else(|| "Others".to_string());
+            if let Some(name) = &other_party {
+                info!("Auto-capture: other party looks like {}", name);
+            }
         }
         {
             let mut meta = AUTO_RECORD_META.lock().unwrap();
@@ -1025,10 +1084,7 @@ pub(crate) fn auto_record_stop(app_handle: AppHandle, app_name: String) {
         if !remaining.is_empty() {
             if let Some(text) = process_and_transcribe_chunk(&remaining) {
                 let mut transcript = ACCUMULATED_TRANSCRIPT.lock().unwrap();
-                if !transcript.is_empty() {
-                    transcript.push(' ');
-                }
-                transcript.push_str(&text);
+                append_with_speaker(&mut transcript, &text);
             }
         }
 
@@ -1048,14 +1104,56 @@ pub(crate) fn auto_record_stop(app_handle: AppHandle, app_name: String) {
             return;
         }
 
+        let other_party = {
+            let label = OTHERS_LABEL.lock().unwrap().clone();
+            if label == "Others" {
+                None
+            } else {
+                Some(label)
+            }
+        };
+
+        let ended_at = chrono::Local::now();
         match engine::transcript_export::write_markdown(
             &app_handle,
             &source_app,
+            other_party.as_deref(),
             &text,
             started_at,
-            chrono::Local::now(),
+            ended_at,
         ) {
-            Ok(path) => info!("Auto-capture: transcript saved to {}", path.display()),
+            Ok(path) => {
+                info!("Auto-capture: transcript saved to {}", path.display());
+                engine::transcript_export::discard_partial(&app_handle, started_at);
+
+                let utterances = AUTO_UTTERANCES.lock().unwrap().clone();
+                match engine::transcript_export::write_sidecar(
+                    &path,
+                    &source_app,
+                    other_party.as_deref(),
+                    &utterances,
+                    started_at,
+                    ended_at,
+                ) {
+                    Ok(sidecar) => {
+                        info!("Auto-capture: timings saved to {}", sidecar.display());
+                        analyse_meeting(app_handle.clone(), sidecar, text.clone());
+                    }
+                    Err(err) => log::warn!("Auto-capture: could not write timings: {}", err),
+                }
+
+                if let Err(err) = engine::transcript_export::append_index(
+                    &app_handle,
+                    &path,
+                    &source_app,
+                    other_party.as_deref(),
+                    &text,
+                    started_at,
+                    ended_at,
+                ) {
+                    log::warn!("Auto-capture: could not update the index: {}", err);
+                }
+            }
             Err(err) => log::warn!("Auto-capture: could not write transcript: {}", err),
         }
 
@@ -1063,6 +1161,46 @@ pub(crate) fn auto_record_stop(app_handle: AppHandle, app_name: String) {
         // note too, otherwise the app itself cannot search or answer questions
         // about meetings it recorded.
         store_transcript_as_note(&app_handle, &source_app, &text, started_at);
+    });
+}
+
+/// Ask a model to pull decisions and action items out of a finished meeting,
+/// and fold the answer into the sidecar.
+///
+/// Runs after the transcript is on disk, and failure is logged rather than
+/// propagated: a meeting that was captured but not analysed is a far better
+/// outcome than losing it because a model was unavailable.
+fn analyse_meeting(app_handle: AppHandle, sidecar: std::path::PathBuf, transcript: String) {
+    tauri::async_runtime::spawn(async move {
+        let provider = app_handle
+            .db(|db| get_setting(db, "post_meeting_analysis"))
+            .map(|setting| setting.setting_value)
+            .unwrap_or_default();
+        let provider = provider.trim();
+
+        if provider.is_empty() || provider.eq_ignore_ascii_case("off") {
+            return;
+        }
+        if transcript.split_whitespace().count() < 30 {
+            info!("Auto-capture: transcript too short to analyse");
+            return;
+        }
+
+        info!("Auto-capture: extracting decisions with provider {}", provider);
+        match engine::document_cleanup_engine::extract_meeting_facts(
+            &app_handle,
+            &transcript,
+            provider,
+            None,
+        )
+        .await
+        {
+            Ok(output) => match engine::transcript_export::attach_analysis(&sidecar, &output) {
+                Ok(()) => info!("Auto-capture: analysis added to {}", sidecar.display()),
+                Err(err) => log::warn!("Auto-capture: could not attach analysis: {}", err),
+            },
+            Err(err) => log::warn!("Auto-capture: analysis failed: {}", err),
+        }
     });
 }
 
@@ -1224,13 +1362,110 @@ fn process_and_transcribe_chunk(raw_samples: &[f32]) -> Option<String> {
     }
 }
 
+/// Transcribe the two sides separately instead of mixing them. Defaults to on
+/// in CUDA builds, where the extra pass is cheap.
+static SEPARATE_SPEAKERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(cfg!(feature = "cuda"));
+
+fn others_label() -> String {
+    OTHERS_LABEL.lock().unwrap().clone()
+}
+
+/// Append text under a speaker heading, starting a new paragraph only when the
+/// speaker changes.
+fn append_labelled(transcript: &mut String, label: &str, text: &str) {
+    let mut last = LAST_SPEAKER.lock().unwrap();
+    if last.as_deref() == Some(label) {
+        if !transcript.is_empty() {
+            transcript.push(' ');
+        }
+    } else {
+        if !transcript.is_empty() {
+            transcript.push_str("\n\n");
+        }
+        transcript.push_str(&format!("**{}:** ", label));
+        *last = Some(label.to_string());
+    }
+    transcript.push_str(text);
+}
+
+/// Append transcribed text, labelled with whoever was louder while it was
+/// recorded.
+///
+/// Labels only appear when system audio is being captured - with the
+/// microphone alone there is no second side to compare against, and a label
+/// would be a guess dressed up as a fact.
+fn append_with_speaker(transcript: &mut String, text: &str) -> String {
+    use crate::engine::audio_engine::SpeakerHint;
+
+    let others = others_label();
+    let label = match crate::engine::audio_engine::take_speaker_hint() {
+        SpeakerHint::Me => Some("Me".to_string()),
+        SpeakerHint::Others => Some(others.clone()),
+        SpeakerHint::Both => Some(format!("Me + {}", others.to_lowercase())),
+        SpeakerHint::Unknown => None,
+    };
+
+    let used = label.clone();
+    match label {
+        Some(label) => {
+            let mut last = LAST_SPEAKER.lock().unwrap();
+            let same_speaker = last.as_deref() == Some(label.as_str());
+            if same_speaker {
+                if !transcript.is_empty() {
+                    transcript.push(' ');
+                }
+            } else {
+                if !transcript.is_empty() {
+                    transcript.push_str("\n\n");
+                }
+                transcript.push_str(&format!("**{}:** ", label));
+                *last = Some(label.clone());
+            }
+        }
+        None => {
+            if !transcript.is_empty() {
+                transcript.push(' ');
+            }
+        }
+    }
+
+    transcript.push_str(text);
+    used.unwrap_or_else(|| "Unknown".to_string())
+}
+
+/// Note a transcribed stretch of speech with its place in the recording.
+fn record_utterance(start_ms: u64, end_ms: u64, speaker: &str, text: &str) {
+    if !AUTO_RECORDING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let mut utterances = AUTO_UTTERANCES.lock().unwrap();
+    utterances.push(engine::transcript_export::Utterance {
+        start_ms,
+        end_ms,
+        speaker: speaker.to_string(),
+        text: text.trim().to_string(),
+    });
+}
+
 /// Realtime transcription loop — polls the audio buffer every 50ms,
 /// accumulates ~2s chunks, transcribes, and emits events
 async fn realtime_transcription_loop(app_handle: AppHandle) {
-    use crate::engine::audio_engine::{IS_RECORDING, DEVICE_SAMPLE_RATE, take_new_samples};
+    use crate::engine::audio_engine::{
+        take_new_samples, take_new_samples_split, DEVICE_SAMPLE_RATE, IS_RECORDING,
+    };
+
+    // Transcribing each side separately doubles the work, which is affordable
+    // on a GPU and usually is not on a laptop CPU - so it follows the build
+    // flavour unless the setting says otherwise.
+    let separate = SEPARATE_SPEAKERS.load(std::sync::atomic::Ordering::SeqCst);
 
     let mut pending: Vec<f32> = Vec::new();
+    let mut pending_system: Vec<f32> = Vec::new();
     let mut silence_count: u32 = 0;
+    // Samples consumed so far, which is the recording's own clock - steadier
+    // than wall time, since it cannot drift when transcription lags.
+    let mut consumed_samples: usize = 0;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1239,7 +1474,14 @@ async fn realtime_transcription_loop(app_handle: AppHandle) {
             break;
         }
 
-        let new = take_new_samples();
+        let new = if separate {
+            let (microphone, system) = take_new_samples_split();
+            pending_system.extend_from_slice(&system);
+            microphone
+        } else {
+            take_new_samples()
+        };
+
         if new.is_empty() {
             continue;
         }
@@ -1274,20 +1516,59 @@ async fn realtime_transcription_loop(app_handle: AppHandle) {
         }
 
         let chunk: Vec<f32> = pending.drain(..).collect();
+        let chunk_system: Vec<f32> = pending_system.drain(..).collect();
         silence_count = 0;
+
+        let start_ms = (consumed_samples as u64) * 1000 / device_rate as u64;
+        consumed_samples += chunk.len();
+        let end_ms = (consumed_samples as u64) * 1000 / device_rate as u64;
 
         // Transcribe on a blocking thread to avoid blocking the async runtime
         let app = app_handle.clone();
         let transcript_arc = ACCUMULATED_TRANSCRIPT.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(text) = process_and_transcribe_chunk(&chunk) {
-                let mut t = transcript_arc.lock().unwrap();
-                if !t.is_empty() {
-                    t.push(' ');
+            let mut updated = false;
+
+            if separate {
+                // Each side is transcribed on its own, so a label is a fact
+                // about which stream carried the speech, not a guess from
+                // loudness. A silent side transcribes to nothing and is
+                // skipped.
+                let others = others_label();
+                for (label, samples) in [("Me", &chunk), (others.as_str(), &chunk_system)] {
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    if let Some(text) = process_and_transcribe_chunk(samples) {
+                        let mut t = transcript_arc.lock().unwrap();
+                        append_labelled(&mut t, label, &text);
+                        record_utterance(start_ms, end_ms, label, &text);
+                        updated = true;
+                    }
                 }
-                t.push_str(&text);
-                let current = t.clone();
-                drop(t);
+            } else if let Some(text) = process_and_transcribe_chunk(&chunk) {
+                let mut t = transcript_arc.lock().unwrap();
+                let label = append_with_speaker(&mut t, &text);
+                record_utterance(start_ms, end_ms, &label, &text);
+                updated = true;
+            }
+
+            if updated {
+                let current = transcript_arc.lock().unwrap().clone();
+
+                // Keep the meeting on disk as it goes, so an interrupted
+                // recording still leaves what it had.
+                if AUTO_RECORDING.load(std::sync::atomic::Ordering::SeqCst) {
+                    let meta = AUTO_RECORD_META.lock().unwrap().clone();
+                    if let Some((source_app, started_at)) = meta {
+                        engine::transcript_export::write_partial(
+                            &app,
+                            &source_app,
+                            &current,
+                            started_at,
+                        );
+                    }
+                }
 
                 if let Some(w) = app.get_window("main") {
                     let _ = w.emit("transcript-update", serde_json::json!({

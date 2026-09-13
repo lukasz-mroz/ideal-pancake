@@ -89,9 +89,44 @@ own:
 2. When a meeting starts, recording begins without a prompt and transcription
    runs locally through Whisper.
 3. When the meeting ends, the transcript is written to `data\transcripts\` as
-   `2026-09-13_15-42_microsoft-teams.md`, with source, times, duration and word
-   count in the header - so another tool can read meetings off the filesystem
-   without touching the database.
+   `2026-09-13_15-42_weekly-sync-microsoft-teams.md`, with source, times,
+   duration and word count in the header - so another tool can read meetings
+   off the filesystem without touching the database. The name comes from the
+   Teams window title when it offers one, which is why a transcript is usually
+   named after the meeting rather than the app.
+
+### Who said what
+
+Transcript lines are labelled `Me` and `Others`, decided by which side was
+louder while that piece of audio was recorded - the microphone or the
+speakers. When both are talking the line is marked `Me + others` rather than
+guessed.
+
+How those labels are produced depends on the build:
+
+- **CUDA builds** transcribe each stream separately, so a label states which
+  stream carried the speech rather than inferring it. A silent side produces
+  nothing and is skipped. This costs a second inference pass per chunk, which a
+  GPU absorbs.
+- **CPU builds** mix the streams and label by loudness balance, because a
+  second pass on a laptop CPU would not keep up with the conversation.
+
+`separate_speaker_streams` overrides the default either way.
+
+### Naming the other person
+
+In a one-to-one call Teams titles its window with the other participant, so
+that name replaces `Others` in the transcript and appears in the file header.
+A scheduled meeting is titled with the meeting's name instead, and nothing in
+the title says which of the two it is - so the test is strict: two or three
+capitalised words, no digits, and none of the words that turn up in meeting
+names (`sync`, `standup`, `spotkanie`, ...). Anything else keeps the neutral
+`Others`, because a wrong name is worse than no name.
+
+Neither approach names people in a group call, and neither separates two voices
+arriving through the same speaker - both sides of that are `Others`. Labels only appear
+when `capture_system_audio` is on; with the microphone alone there is no second
+stream.
 
 ### Both sides of the call
 
@@ -182,6 +217,50 @@ the meeting ends.
 
 A bundled Whisper model is copied in only when the installation has none, so an
 update never re-downloads or overwrites gigabytes that are already there.
+
+### What a finished meeting leaves behind
+
+```
+data\transcripts\
+  2026-09-13_15-42_weekly-sync-microsoft-teams.md     prose, for people
+  2026-09-13_15-42_weekly-sync-microsoft-teams.json   utterances with timings
+  index.jsonl                                          one line per meeting
+```
+
+The `.json` companion lists every stretch of speech with `start_ms`, `end_ms`,
+`speaker` and `text`, timed against the start of the recording using the audio
+clock rather than wall time - so the timings hold even when transcription lags
+behind the conversation. A model asked "what was agreed near the end" filters
+on timestamps instead of reading the whole transcript.
+
+Once the transcript is safely on disk, a model is asked to pull the meeting
+apart into `decisions`, `action_items`, `topics` and `open_questions`, and the
+answer is folded into the `.json` as `analysis`. Each decision carries
+`changed_from`, filled in only when the transcript itself says a position was
+revised - which is what makes it possible to ask whether a call overturned
+something agreed earlier somewhere else.
+
+`post_meeting_analysis` picks the provider: `local` (Ollama, nothing leaves the
+machine), `claude`, `openai`, `gemini`, or `off`. The pass runs after the files
+are written and its failure is logged, never fatal: a meeting captured but not
+analysed beats a meeting lost to an unavailable model. Hosted models are
+noticeably better at this than a small local one, so `local` is the private
+default rather than the accurate one.
+
+`index.jsonl` gets one appended line per meeting: times, duration, source,
+other party, word count and the transcript's filename. A folder of several
+hundred transcripts stays searchable without opening any of them.
+
+### While a meeting runs
+
+The transcript is written to `data\transcripts\<time>.partial.md` every few
+seconds and replaced by the finished file when the meeting ends. A crash, a
+power cut or a killed process therefore costs the last few seconds rather than
+the whole meeting - a `.partial.md` left behind is a meeting that never
+finished cleanly.
+
+Captured audio is released as soon as Whisper has read it; nothing keeps the
+recording in memory for the length of the meeting.
 
 ## Helper scripts inside the package
 

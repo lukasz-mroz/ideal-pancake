@@ -299,20 +299,99 @@ pub async fn stop_recording_local() -> std::result::Result<(), String> {
 
 /// Get new (unprocessed) samples from the buffer for the realtime loop
 pub fn take_new_samples() -> Vec<f32> {
-    let mut new_samples = {
-        let buf = AUDIO_BUFFER.lock().unwrap();
-        let mut count = PROCESSED_SAMPLE_COUNT.lock().unwrap();
-        let start = *count;
-        if start >= buf.len() {
-            return Vec::new();
-        }
-        let taken = buf[start..].to_vec();
-        *count = buf.len();
+    let mut new_samples = take_microphone_samples();
+    mix_in_system_audio(&mut new_samples);
+    new_samples
+}
+
+/// Microphone and system audio as two streams, for transcribing each side on
+/// its own instead of mixing them. The system side is resampled to the
+/// microphone's rate and covers the same stretch of time.
+pub fn take_new_samples_split() -> (Vec<f32>, Vec<f32>) {
+    let microphone = take_microphone_samples();
+    if microphone.is_empty() {
+        return (microphone, Vec::new());
+    }
+
+    let rate = DEVICE_SAMPLE_RATE.load(Ordering::SeqCst);
+    if rate == 0 || !CAPTURE_SYSTEM_AUDIO.load(Ordering::SeqCst) {
+        return (microphone, Vec::new());
+    }
+
+    let system = crate::engine::loopback_capture::take_samples(rate, microphone.len());
+    (microphone, system)
+}
+
+/// Take everything recorded since the last call, and release it.
+///
+/// The buffer used to keep every sample of a recording: an index advanced over
+/// a Vec that nothing ever emptied. At 48 kHz that is about 690 MB of memory
+/// per hour of meeting - fine for the voice notes this started as, not for a
+/// recorder that runs all day. Consumed audio is dropped now; whisper has
+/// already seen it.
+fn take_microphone_samples() -> Vec<f32> {
+    let mut buf = AUDIO_BUFFER.lock().unwrap();
+    let mut count = PROCESSED_SAMPLE_COUNT.lock().unwrap();
+    if buf.is_empty() {
+        *count = 0;
+        return Vec::new();
+    }
+    let taken = std::mem::take(&mut *buf);
+    *count = 0;
+    taken
+}
+
+/// Which side of the call was louder in the audio processed so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeakerHint {
+    /// Mostly the local microphone.
+    Me,
+    /// Mostly what came out of the speakers.
+    Others,
+    /// Both at once, or too close to call.
+    Both,
+    /// Silence, or system audio capture is off.
+    Unknown,
+}
+
+/// Summed energy of each side since the last read: (microphone, speakers).
+static SIDE_ENERGY: once_cell::sync::Lazy<std::sync::Mutex<(f64, f64)>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new((0.0, 0.0)));
+
+/// Read and reset the energy balance.
+///
+/// This is a cheap stand-in for speaker diarisation: whoever was louder in a
+/// chunk is almost certainly who was talking. It costs nothing, unlike
+/// transcribing both streams separately, and is wrong mainly when people talk
+/// over each other - which is reported as `Both` rather than guessed.
+pub fn take_speaker_hint() -> SpeakerHint {
+    let (mic, system) = {
+        let mut energy = SIDE_ENERGY.lock().unwrap();
+        let taken = *energy;
+        *energy = (0.0, 0.0);
         taken
     };
 
-    mix_in_system_audio(&mut new_samples);
-    new_samples
+    // Below this both sides are effectively silence.
+    const FLOOR: f64 = 1e-6;
+    if mic < FLOOR && system < FLOOR {
+        return SpeakerHint::Unknown;
+    }
+    if system < FLOOR {
+        return SpeakerHint::Me;
+    }
+    if mic < FLOOR {
+        return SpeakerHint::Others;
+    }
+
+    let ratio = mic / system;
+    if ratio > 3.0 {
+        SpeakerHint::Me
+    } else if ratio < 1.0 / 3.0 {
+        SpeakerHint::Others
+    } else {
+        SpeakerHint::Both
+    }
 }
 
 /// Sum the speaker output into the microphone samples.
@@ -335,18 +414,27 @@ fn mix_in_system_audio(mic: &mut [f32]) {
         return;
     }
 
+    let mut mic_energy = 0.0f64;
+    let mut system_energy = 0.0f64;
+
     for (sample, other) in mic.iter_mut().zip(system.iter()) {
+        mic_energy += (*sample as f64) * (*sample as f64);
+        system_energy += (*other as f64) * (*other as f64);
         *sample = (*sample * 0.8 + *other * 0.8).clamp(-1.0, 1.0);
+    }
+
+    let count = system.len().min(mic.len()) as f64;
+    if count > 0.0 {
+        let mut energy = SIDE_ENERGY.lock().unwrap();
+        energy.0 += mic_energy / count;
+        energy.1 += system_energy / count;
     }
 }
 
 /// Drain all remaining samples (called at stop for final processing)
 pub fn drain_all_samples() -> Vec<f32> {
-    let buf = AUDIO_BUFFER.lock().unwrap();
-    let count = PROCESSED_SAMPLE_COUNT.lock().unwrap();
-    let start = *count;
-    if start >= buf.len() {
-        return Vec::new();
-    }
-    buf[start..].to_vec()
+    let mut buf = AUDIO_BUFFER.lock().unwrap();
+    let mut count = PROCESSED_SAMPLE_COUNT.lock().unwrap();
+    *count = 0;
+    std::mem::take(&mut *buf)
 }

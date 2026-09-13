@@ -193,8 +193,22 @@ put a shortcut with the `--minimized` argument in the Startup folder.
 - Transcribes locally with Whisper; the spoken language is detected once per
   recording and held for its duration (`transcription_language` forces a code
   like `pl` instead).
-- Writes the transcript to `data\transcripts\<date>_<app>.md` and stores it as a
-  note inside the app.
+- Labels transcript lines `Me` / `Others`. CUDA builds transcribe each stream
+  separately, so the label reflects which stream the speech came from; CPU
+  builds mix the streams and label by loudness balance (`Me + others` when both
+  talk at once). `separate_speaker_streams` overrides the default. Neither
+  names people.
+- Writes three things to `data\transcripts\`: the transcript as `<date>_<meeting>.md`
+  (named after the Teams window title when there is one), a `.json` companion
+  listing utterances with `start_ms`/`end_ms`/`speaker`, and an appended line in
+  `index.jsonl`. The meeting is also stored as a note inside the app.
+- After the files are written, a model extracts `decisions` (each with
+  `changed_from`), `action_items`, `topics` and `open_questions` into the
+  `.json` under `analysis`. Provider comes from `post_meeting_analysis`
+  (`local` = Ollama, or `claude`/`openai`/`gemini`/`off`).
+- While a meeting runs, the transcript is kept in `<time>.partial.md` and
+  replaced by the finished file at the end. A leftover `.partial.md` means a
+  recording that was interrupted.
 
 Settings live in `data\platypus.sqlite` and are seeded on first run:
 `use_local_transcription`, `whisper_model`, `meeting_detection_enabled`,

@@ -360,6 +360,49 @@ fn parse_slides(raw: &str) -> Result<Vec<Slide>, String> {
         .map_err(|e| format!("Failed to parse slide JSON: {}. Raw response began with: {}", e, &trimmed.chars().take(120).collect::<String>()))
 }
 
+/// Extraction prompt for automatically captured meetings.
+///
+/// The output is consumed by other tools rather than read, so it asks for JSON
+/// and nothing else. Decisions carry `changed_from` because the question these
+/// transcripts exist to answer is usually "did this change since we agreed it
+/// in chat", not "what was said".
+const MEETING_EXTRACTION_PROMPT: &str = r##"You extract structured facts from a meeting transcript.
+
+Reply with a single JSON object and nothing else - no prose, no code fences.
+
+{
+  "summary": "two or three sentences on what the meeting was about and how it ended",
+  "topics": ["short topic labels"],
+  "decisions": [
+    {
+      "topic": "what the decision is about",
+      "decision": "what was decided, in one sentence",
+      "changed_from": "the previous position if the transcript says the decision changed, otherwise null",
+      "confidence": "high | medium | low"
+    }
+  ],
+  "action_items": [
+    { "who": "name or null", "what": "the task", "due": "date or null" }
+  ],
+  "open_questions": ["questions left unresolved"]
+}
+
+Rules:
+- Use the language of the transcript for the values.
+- Record only what the transcript supports. An empty list is a valid answer.
+- Set changed_from only when the transcript itself indicates a reversal or revision.
+- Speaker labels in the transcript ("**Me:**", a person's name) identify who spoke."##;
+
+/// Run the extraction over a finished transcript.
+pub async fn extract_meeting_facts(
+    app_handle: &tauri::AppHandle,
+    transcript: &str,
+    provider: &str,
+    model_id: Option<String>,
+) -> Result<String, String> {
+    send_to_llm(app_handle, transcript, provider, model_id, MEETING_EXTRACTION_PROMPT).await
+}
+
 async fn send_to_llm(
     app_handle: &tauri::AppHandle,
     plain_text: &str,

@@ -301,6 +301,153 @@ fn is_zoom_in_meeting(_system: &System) -> bool {
     app_holding_mic("zoom")
 }
 
+/// Title of the Teams window that looks like a meeting, e.g. the meeting name
+/// or the person being called. Used to name the transcript; never used to
+/// decide whether a meeting is happening.
+#[cfg(target_os = "windows")]
+pub fn meeting_window_title(system: &System) -> Option<String> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    struct Search {
+        pids: Vec<u32>,
+        found: Option<String>,
+    }
+
+    unsafe extern "system" fn visit(window: HWND, param: LPARAM) -> BOOL {
+        let search = &mut *(param.0 as *mut Search);
+
+        if !IsWindowVisible(window).as_bool() {
+            return BOOL(1);
+        }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        if !search.pids.contains(&pid) {
+            return BOOL(1);
+        }
+
+        let length = GetWindowTextLengthW(window);
+        if length <= 0 {
+            return BOOL(1);
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let written = GetWindowTextW(window, &mut buffer);
+        if written <= 0 {
+            return BOOL(1);
+        }
+        let title = String::from_utf16_lossy(&buffer[..written as usize]);
+
+        // "Weekly sync | Microsoft Teams" -> "Weekly sync". A window titled
+        // only with the app name tells us nothing, so keep looking.
+        let cleaned = title
+            .split('|')
+            .next()
+            .unwrap_or(&title)
+            .trim()
+            .trim_end_matches('-')
+            .trim()
+            .to_string();
+
+        if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("Microsoft Teams") {
+            return BOOL(1);
+        }
+
+        search.found = Some(cleaned);
+        BOOL(0)
+    }
+
+    let pids: Vec<u32> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| {
+            let name = process.name();
+            name == "MSTeams" || name == "Teams" || process.cmd().join(" ").contains("Microsoft Teams")
+        })
+        .map(|(pid, _)| pid.as_u32())
+        .collect();
+
+    if pids.is_empty() {
+        return None;
+    }
+
+    let mut search = Search { pids, found: None };
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize));
+    }
+    search.found
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn meeting_window_title(_system: &System) -> Option<String> {
+    None
+}
+
+/// Words that mark a window title as the name of a meeting rather than of a
+/// person. Kept deliberately short: a false "this is a person" costs a wrong
+/// label, so the test errs towards saying no.
+const MEETING_WORDS: [&str; 22] = [
+    "meeting", "call", "sync", "standup", "stand-up", "daily", "weekly", "monthly", "review",
+    "retro", "planning", "kickoff", "demo", "workshop", "interview", "spotkanie", "rozmowa",
+    "zebranie", "narada", "prezentacja", "szkolenie", "status",
+];
+
+/// Prefixes Teams puts in front of a person's name in a one-to-one call.
+const CALL_PREFIXES: [&str; 6] = [
+    "call with ", "meeting with ", "chat with ", "rozmowa z ", "spotkanie z ", "połączenie z ",
+];
+
+/// Read a window title as the name of the person on the other end, when it
+/// plausibly is one.
+///
+/// In a one-to-one call Teams titles the window with the other participant;
+/// in a scheduled meeting it uses the meeting's name. Nothing in the title
+/// distinguishes the two, so this applies a deliberately strict test: two or
+/// three capitalised words, no digits, and none of the words that show up in
+/// meeting names. Anything else returns None and the transcript keeps the
+/// neutral "Others" label.
+pub fn other_party_from_title(title: &str) -> Option<String> {
+    let mut candidate = title.trim().to_string();
+
+    let lowered = candidate.to_lowercase();
+    for prefix in CALL_PREFIXES {
+        if lowered.starts_with(prefix) {
+            candidate = candidate[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
+
+    if candidate.is_empty() || candidate.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let lowered = candidate.to_lowercase();
+    if MEETING_WORDS.iter().any(|word| lowered.contains(word)) {
+        return None;
+    }
+
+    let words: Vec<&str> = candidate.split_whitespace().collect();
+    if words.len() < 2 || words.len() > 3 {
+        return None;
+    }
+
+    let looks_like_name = words.iter().all(|word| {
+        let mut chars = word.chars();
+        match chars.next() {
+            Some(first) => first.is_uppercase() && word.chars().count() >= 2,
+            None => false,
+        }
+    });
+
+    if looks_like_name {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn is_teams_in_meeting(system: &System) -> bool {
     if !is_teams_running(system) {
@@ -327,6 +474,11 @@ impl MeetingDetector {
             cooldowns: HashMap::new(),
             absent_counts: HashMap::new(),
         }
+    }
+
+    /// Title of the meeting window, if one can be read.
+    fn window_title(&self) -> Option<String> {
+        meeting_window_title(&self.system)
     }
 
     /// Poll running processes. Returns (newly detected, just ended) meeting
@@ -440,7 +592,18 @@ pub fn start_meeting_detection(app_handle: AppHandle) {
                 // Silent capture: start recording without asking. The popup
                 // and banner below are skipped entirely in this mode.
                 if crate::auto_capture_enabled(&app_handle) {
-                    crate::auto_record_start(app_handle.clone(), app_name.clone());
+                    // Name the recording after the meeting when the window
+                    // title offers one: "Weekly sync" reads better than
+                    // "Microsoft Teams" in a folder of transcripts.
+                    let title = detector.window_title();
+                    let label = match &title {
+                        Some(title) => format!("{} ({})", title, app_name),
+                        None => app_name.clone(),
+                    };
+                    // In a one-to-one call the window title is the other
+                    // person, and naming them beats a generic "Others".
+                    let other_party = title.as_deref().and_then(other_party_from_title);
+                    crate::auto_record_start(app_handle.clone(), label, other_party);
                     continue;
                 }
 
@@ -462,4 +625,35 @@ pub fn start_meeting_detection(app_handle: AppHandle) {
             std::thread::sleep(Duration::from_secs(5));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::other_party_from_title;
+
+    #[test]
+    fn reads_a_name_from_a_one_to_one_call() {
+        assert_eq!(
+            other_party_from_title("Jan Kowalski"),
+            Some("Jan Kowalski".to_string())
+        );
+        assert_eq!(
+            other_party_from_title("Call with Anna Nowak"),
+            Some("Anna Nowak".to_string())
+        );
+    }
+
+    #[test]
+    fn refuses_meeting_names() {
+        assert_eq!(other_party_from_title("Weekly sync"), None);
+        assert_eq!(other_party_from_title("Spotkanie zespolu"), None);
+        assert_eq!(other_party_from_title("Sprint planning 12"), None);
+    }
+
+    #[test]
+    fn refuses_anything_that_is_not_shaped_like_a_name() {
+        assert_eq!(other_party_from_title("Kowalski"), None);
+        assert_eq!(other_party_from_title("a b"), None);
+        assert_eq!(other_party_from_title(""), None);
+    }
 }
