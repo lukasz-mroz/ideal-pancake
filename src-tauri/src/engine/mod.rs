@@ -5,6 +5,7 @@ pub mod chat_engine_openai;
 pub mod chat_engine_gemini;
 pub mod chat_engine_local;
 pub mod audio_engine;
+pub mod self_test;
 pub mod transcript_export;
 pub mod transcription_engine;
 pub mod project_vector_engine;

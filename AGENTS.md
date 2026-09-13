@@ -162,7 +162,18 @@ Nothing is written to `%APPDATA%` or the registry. The database, vector
 indices, Whisper models, recordings, logs and WebView2 storage all sit in
 `data\` next to the executable.
 
-### 6. First run
+### 6. Verify the installation
+
+```
+Platypus.exe --self-test
+```
+
+Plays a tone, records, transcribes, and writes `data\self-test.md` saying what
+worked. Every line marked `[FAIL]` names what to fix. Run this after an install
+and after an update - it is the only way to tell an unattended recorder is
+working without holding a meeting.
+
+### 7. First run
 
 `Start Platypus.cmd` installs the WebView2 runtime if Windows lacks it, then
 launches the app. The executable is unsigned, so SmartScreen warns on first

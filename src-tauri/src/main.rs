@@ -259,6 +259,43 @@ async fn main() {
             setup_keypress_listener(&app_handle);
             seed_default_settings(&app_handle);
 
+            // `Platypus.exe --self-test` checks the capture chain and exits,
+            // so a freshly installed machine can be verified without waiting
+            // for a real meeting.
+            if args.contains(&"--self-test".to_string()) {
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Give the whisper engine a chance to load first.
+                    let model_id = handle
+                        .db(|db| get_setting(db, "whisper_model"))
+                        .map(|setting| setting.setting_value)
+                        .unwrap_or_default();
+                    let model_id = if model_id.trim().is_empty() {
+                        "large-v3".to_string()
+                    } else {
+                        model_id
+                    };
+                    if engine::whisper_engine::is_model_downloaded(&model_id) {
+                        if let Ok(loaded) = engine::whisper_engine::WhisperEngine::load(&model_id) {
+                            *WHISPER_ENGINE.lock().unwrap() = Some(loaded);
+                        }
+                    }
+
+                    let report = engine::self_test::run(&handle).await;
+                    println!("{}", report);
+
+                    if let Some(dir) = configuration::portable::app_data_dir(&handle) {
+                        let path = dir.join("self-test.md");
+                        match std::fs::write(&path, &report) {
+                            Ok(()) => info!("Self-test report written to {}", path.display()),
+                            Err(err) => log::warn!("Could not write the self-test report: {}", err),
+                        }
+                    }
+
+                    handle.exit(0);
+                });
+            }
+
             let language = app_handle
                 .db(|db| get_setting(db, "transcription_language"))
                 .map(|setting| setting.setting_value)
@@ -1326,12 +1363,54 @@ fn get_transcript() -> String {
 /// No RMS gate — Whisper itself handles silence (returns empty), so we let
 /// every chunk through to avoid dropping quiet speech (soft speakers, laptop
 /// speaker playback, distant voices).
+/// Transcribe a buffer directly, for the self-test. Bypasses the silence gate
+/// so the report can say "heard nothing" instead of silently skipping.
+pub(crate) fn transcribe_samples_for_test(raw_samples: &[f32]) -> Option<String> {
+    use crate::engine::audio_processor::resample;
+
+    let device_rate = crate::engine::audio_engine::DEVICE_SAMPLE_RATE
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if device_rate == 0 || raw_samples.is_empty() {
+        return None;
+    }
+    let samples_16k = resample(raw_samples, device_rate, 16000).ok()?;
+
+    let guard = WHISPER_ENGINE.lock().unwrap();
+    let engine = guard.as_ref()?;
+    match engine.transcribe(&samples_16k) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => None,
+        Err(err) => {
+            log::warn!("Self-test transcription error: {}", err);
+            None
+        }
+    }
+}
+
+/// Below this RMS a chunk carries no speech worth transcribing.
+///
+/// This matters for more than saving cycles: given silence, whisper.cpp
+/// reliably invents something - "Thank you.", "Dziękuję.", subtitle credits -
+/// because it always decodes *something*. A recorder that runs through a
+/// forty-minute meeting where one mostly listens would fill the transcript
+/// with those, and the extraction pass downstream would treat them as things
+/// that were said.
+const SILENCE_RMS: f32 = 0.004;
+
 fn process_and_transcribe_chunk(raw_samples: &[f32]) -> Option<String> {
     use crate::engine::audio_processor::resample;
 
     let device_rate = crate::engine::audio_engine::DEVICE_SAMPLE_RATE
         .load(std::sync::atomic::Ordering::SeqCst);
     if device_rate == 0 {
+        return None;
+    }
+
+    if raw_samples.is_empty() {
+        return None;
+    }
+    let rms = (raw_samples.iter().map(|s| s * s).sum::<f32>() / raw_samples.len() as f32).sqrt();
+    if rms < SILENCE_RMS {
         return None;
     }
 

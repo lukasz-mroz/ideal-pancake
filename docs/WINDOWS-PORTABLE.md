@@ -218,6 +218,31 @@ the meeting ends.
 A bundled Whisper model is copied in only when the installation has none, so an
 update never re-downloads or overwrites gigabytes that are already there.
 
+### Checking a machine works
+
+```
+Platypus.exe --self-test
+```
+
+Records for a few seconds while playing a 440 Hz tone through the speakers,
+then reports whether the data directory is writable, the Whisper model is
+present, the microphone captured anything, the tone came back through loopback
+capture, and what Whisper made of it. The report goes to `data\self-test.md`
+and to stdout, and the app exits.
+
+Worth running after every install and after any update on a machine nobody
+watches: an unattended recorder fails silently, and the first sign is otherwise
+an empty transcript after a conversation that mattered.
+
+### Silence
+
+Chunks below a low energy threshold are never sent to Whisper. This is not
+only about saving cycles: given silence, whisper.cpp reliably invents
+something - "Thank you.", "Dziękuję.", subtitle credits - because it always
+decodes *something*. In a meeting where one mostly listens, those phantom
+lines would otherwise fill the transcript and be read as statements by the
+extraction pass.
+
 ### What a finished meeting leaves behind
 
 ```
