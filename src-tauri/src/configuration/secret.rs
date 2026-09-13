@@ -52,9 +52,8 @@ pub fn reveal(value: &str) -> String {
 
 #[cfg(target_os = "windows")]
 fn encrypt(data: &[u8]) -> Option<Vec<u8>> {
-    use windows::Win32::Foundation::HLOCAL;
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
-    use windows::Win32::System::Memory::LocalFree;
 
     unsafe {
         let mut input = CRYPT_INTEGER_BLOB {
@@ -74,9 +73,8 @@ fn encrypt(data: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 fn decrypt(data: &[u8]) -> Option<Vec<u8>> {
-    use windows::Win32::Foundation::HLOCAL;
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
-    use windows::Win32::System::Memory::LocalFree;
 
     unsafe {
         let mut input = CRYPT_INTEGER_BLOB {
