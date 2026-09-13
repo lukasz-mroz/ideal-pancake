@@ -24,6 +24,13 @@ if not exist "%CUDA_PATH%\bin\nvcc.exe" goto :nocuda
 
 echo CUDA_PATH: %CUDA_PATH%
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>nul
+if errorlevel 1 echo No NVIDIA GPU in this machine - building anyway; nvcc does not need one.
+
+rem Pin the GPU architecture the kernels are built for. Without this a machine
+rem with no NVIDIA card has nothing to detect. Edit src-tauri\cuda-toolchain.cmake
+rem for a card that is not Turing.
+set "CMAKE_TOOLCHAIN_FILE=%CD%\src-tauri\cuda-toolchain.cmake"
+echo CUDA arch: & type "src-tauri\cuda-toolchain.cmake" | findstr /i "CMAKE_CUDA_ARCHITECTURES"
 echo.
 
 echo [1/3] npm install + frontend ...

@@ -21,7 +21,9 @@ release. Note GitHub's 2 GB limit per release asset — bundling `large-v3`
 
 **Locally on a Windows machine**
 
-Requirements: Node 18+, Rust, cmake, LLVM (see the main README), then:
+Requirements: Node 18+, Rust, cmake, LLVM and the MSVC C++ build tools -
+`scripts\setup-windows-toolchain.cmd` installs all of them with winget (add
+`winget install Nvidia.CUDA` for the GPU build). Then:
 
 ```powershell
 npm install
