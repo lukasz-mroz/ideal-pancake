@@ -204,7 +204,8 @@ mod imp {
                         let cap = (sample_rate as usize) * 60;
                         if buffer.len() + mono.len() > cap {
                             let overflow = buffer.len() + mono.len() - cap;
-                            buffer.drain(..overflow.min(buffer.len()));
+                            let trim = overflow.min(buffer.len());
+                            buffer.drain(..trim);
                         }
                         buffer.extend_from_slice(&mono);
                     }
