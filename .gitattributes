@@ -1,0 +1,6 @@
+# Windows batch and PowerShell scripts must keep CRLF endings: cmd.exe
+# mis-parses LF-only .cmd files (labels and multi-line if blocks silently
+# break), and git would otherwise hand out LF copies on clone.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
