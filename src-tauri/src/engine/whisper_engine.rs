@@ -113,13 +113,16 @@ fn remember_detected_language(state: &whisper_rs::WhisperState, text: &str) {
         }
     }
 
-    // Older whisper-rs releases spell this `full_lang_id`.
-    if let Ok(id) = state.full_lang_id_from_state() {
-        if let Some(code) = whisper_rs::get_lang_str(id) {
-            let mut detected = DETECTED_LANGUAGE.lock().unwrap();
-            *detected = Some(code.to_string());
-            info!("Detected spoken language: {} - keeping it for this recording", code);
-        }
+    // Returns the id directly in whisper-rs 0.16 (newer releases wrap it in a
+    // Result).
+    let id = state.full_lang_id_from_state();
+    if let Some(code) = whisper_rs::get_lang_str(id) {
+        let mut detected = DETECTED_LANGUAGE.lock().unwrap();
+        *detected = Some(code.to_string());
+        info!(
+            "Detected spoken language: {} - keeping it for this recording",
+            code
+        );
     }
 }
 

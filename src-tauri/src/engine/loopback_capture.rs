@@ -97,7 +97,10 @@ mod imp {
         };
 
         unsafe {
+            // Returns an HRESULT rather than a Result in this version of the
+            // windows crate; `.ok()` turns it into one.
             CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
                 .map_err(|e| format!("CoInitializeEx failed: {}", e))?;
 
             let result = (|| -> Result<(), String> {
