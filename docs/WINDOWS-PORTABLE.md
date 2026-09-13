@@ -308,6 +308,33 @@ half-file.
 Captured audio is released as soon as Whisper has read it; nothing keeps the
 recording in memory for the length of the meeting.
 
+## Security notes
+
+- **API keys are encrypted at rest.** Keys for Claude, OpenAI, Gemini and
+  ElevenLabs are wrapped with Windows DPAPI before they are written to
+  `platypus.sqlite`, so the value is tied to the current Windows user. A
+  database copied to another machine or another user account will not decrypt
+  them - they are simply blank there and must be re-entered. Keys saved before
+  this change are re-encrypted the next time they are saved.
+
+- **The executable is not signed.** SmartScreen warns on first launch, and an
+  unsigned recorder that captures audio and watches other processes looks, to
+  an endpoint security product, much like something unwanted. On managed or
+  corporate machines, sign the build and clear it with whoever runs security
+  before deploying. `tauri.conf.json` has the hook
+  (`bundle.windows.certificateThumbprint`) for a signing certificate.
+
+- **Prefer a real install location over a USB stick.** A removable drive full
+  of meeting transcripts is what data-loss-prevention tooling is built to
+  flag, and the drive is unencrypted unless you encrypt it. Copy the folder to
+  a normal disk (ideally BitLocker-protected) rather than running it from the
+  stick when the recordings matter.
+
+- **Recording without telling the other participants** is a policy and consent
+  question, not a technical one, and no setting here addresses it. Teams shows
+  a banner when *it* records; this does not. Whether that is acceptable is
+  yours (and your organisation's) to decide.
+
 ## Helper scripts inside the package
 
 Every package carries two small scripts, run from the unpacked folder:
