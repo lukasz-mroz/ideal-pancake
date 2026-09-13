@@ -57,8 +57,28 @@ try {
     $stageName = "Platypus-Portable-$version-win-x64"
     $stage = Join-Path $OutDir $stageName
 
+    # A previous package that was run in place holds open files - WebView2
+    # keeps a memory-mapped metrics file - so deleting the old staging folder
+    # fails while the app is alive.
+    $running = Get-Process -Name 'Platypus' -ErrorAction SilentlyContinue
+    if ($running) {
+        throw 'Platypus is running. Close it and run this again - the packaging step cannot replace files the running app holds open.'
+    }
+
     Write-Host "==> Staging $stage"
-    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    if (Test-Path $stage) {
+        try {
+            Remove-Item $stage -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            # Something still holds a file open (a WebView2 process outliving
+            # the app, an open Explorer window). Move the old folder aside
+            # rather than failing the build.
+            $parked = "$stage.old-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+            Rename-Item -Path $stage -NewName (Split-Path -Leaf $parked) -ErrorAction Stop
+            Write-Warning "Could not delete the previous package; moved it to $parked - delete it yourself later."
+        }
+    }
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $stage 'data\models') -Force | Out-Null
 

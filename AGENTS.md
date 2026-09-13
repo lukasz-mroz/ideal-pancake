@@ -153,6 +153,11 @@ Copy the folder from `dist-portable\` (or `dist-portable-cuda\`) wherever it
 should live. It is self-contained: the executable, its `data\` folder and the
 helper scripts.
 
+**Never run the app from `dist-portable\` as the real installation.** That
+folder is wiped and rebuilt on every package, taking its `data\` with it -
+notes, transcripts and downloaded models included. Packaging also refuses to
+run while Platypus is open, because a live instance holds WebView2's files.
+
 Nothing is written to `%APPDATA%` or the registry. The database, vector
 indices, Whisper models, recordings, logs and WebView2 storage all sit in
 `data\` next to the executable.

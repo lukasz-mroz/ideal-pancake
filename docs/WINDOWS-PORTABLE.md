@@ -152,6 +152,17 @@ not use.
 Everyone on the call is a participant in this recording. Whether they are told
 is your call, not the software's.
 
+### Do not use the build output as the installation
+
+`dist-portable\` is rebuilt from scratch every time you package, so anything
+that accumulates there - notes, transcripts, downloaded models - is deleted on
+the next build. Copy the folder somewhere else and run it from there; use
+`scripts\update-portable.ps1` to move new builds into it.
+
+Packaging also refuses to run while Platypus is open: a running instance holds
+WebView2's memory-mapped files, and the old staging folder cannot be replaced
+underneath it.
+
 ## Updating an installation
 
 Every package carries `VERSION.txt` (version, git commit, flavour, build date),
