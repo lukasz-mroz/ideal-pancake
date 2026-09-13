@@ -54,6 +54,14 @@ fn suppress_whisper_logs() {
     });
 }
 
+/// One timed piece of speech as whisper.cpp split it.
+pub struct Segment {
+    /// Milliseconds from the start of the audio handed to `transcribe_segments`.
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
 lazy_static::lazy_static! {
     /// Language passed to whisper.cpp: a code like "pl", or "auto".
     static ref LANGUAGE: std::sync::Mutex<String> = std::sync::Mutex::new("auto".to_string());
@@ -234,6 +242,77 @@ impl WhisperEngine {
 
         info!("Whisper model loaded successfully");
         Ok(Self { ctx })
+    }
+
+    /// Transcribe and keep whisper's own segment boundaries and timings.
+    ///
+    /// `transcribe` asks for a single segment with no timestamps, which
+    /// collapses several sentences into one block timed only by the chunk it
+    /// came from. Here the segments survive, so a transcript can say when a
+    /// sentence was spoken rather than which three seconds it fell in.
+    pub fn transcribe_segments(&self, samples_16k: &[f32]) -> Result<Vec<Segment>> {
+        if samples_16k.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut state = self
+            .ctx
+            .create_state()
+            .map_err(|e| anyhow!("Failed to create whisper state: {:?}", e))?;
+
+        let language = language();
+
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_language(Some(&language));
+        params.set_translate(false);
+        params.set_single_segment(false);
+        params.set_no_timestamps(false);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_suppress_blank(true);
+        params.set_n_threads(inference_threads());
+
+        state
+            .full(params, samples_16k)
+            .map_err(|e| anyhow!("Whisper inference failed: {:?}", e))?;
+
+        let mut segments = Vec::new();
+        let mut whole = String::new();
+        let n_segments = state.full_n_segments();
+
+        for i in 0..n_segments {
+            let Some(segment) = state.get_segment(i) else {
+                continue;
+            };
+            let Ok(text) = segment.to_str_lossy() else {
+                continue;
+            };
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+
+            // whisper.cpp counts in centiseconds. Older whisper-rs releases
+            // spell these state.full_get_segment_t0(i) / _t1(i) instead.
+            let start = segment.start_timestamp().max(0) as u64 * 10;
+            let end = segment.end_timestamp().max(0) as u64 * 10;
+
+            whole.push(' ');
+            whole.push_str(&text);
+            segments.push(Segment {
+                start_ms: start,
+                end_ms: end.max(start),
+                text,
+            });
+        }
+
+        if language == "auto" {
+            remember_detected_language(&state, &whole);
+        }
+
+        Ok(segments)
     }
 
     pub fn transcribe(&self, samples_16k: &[f32]) -> Result<String> {

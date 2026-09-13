@@ -13,6 +13,10 @@ use serde::Serialize;
 
 use crate::configuration::portable;
 
+/// Version of the on-disk format, so a reader can tell what it is looking at
+/// when these files outlive the build that wrote them.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// One stretch of speech, timed against the start of the recording.
 #[derive(Clone, Debug, Serialize)]
 pub struct Utterance {
@@ -20,6 +24,20 @@ pub struct Utterance {
     pub end_ms: u64,
     pub speaker: String,
     pub text: String,
+}
+
+/// Stable identifier for a meeting, carried by all of its files.
+///
+/// Filenames are not identity: two meetings can start in the same minute, a
+/// file can be renamed, and the index would then point at nothing. This is
+/// derived from the start time and the source, and never changes.
+pub fn meeting_id(source_app: &str, started_at: DateTime<Local>) -> String {
+    let mut hash: u32 = 2166136261;
+    for byte in source_app.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    format!("{}-{:04x}", started_at.format("%Y%m%dT%H%M%S"), hash & 0xffff)
 }
 
 /// Directory transcripts are written to.
@@ -79,6 +97,7 @@ pub fn write_markdown(
 
     let body = format!(
         "# {source_app} - {date}\n\n\
+         - Meeting id: {meeting_id}\n\
          - Source: {source_app}\n\
          {other_party_line}\
          - Started: {started}\n\
@@ -89,6 +108,7 @@ pub fn write_markdown(
          ---\n\n\
          {text}\n",
         source_app = source_app,
+        meeting_id = meeting_id(source_app, started_at),
         other_party_line = other_party_line,
         date = started_at.format("%Y-%m-%d %H:%M"),
         started = started_at.format("%Y-%m-%d %H:%M:%S"),
@@ -165,14 +185,33 @@ pub fn write_sidecar(
 ) -> Result<PathBuf, String> {
     let path = markdown_path.with_extension("json");
 
+    // Each utterance also carries the wall-clock time it began, so joining a
+    // transcript with anything else that happened that day needs no
+    // arithmetic against the header.
+    let timed: Vec<serde_json::Value> = utterances
+        .iter()
+        .map(|utterance| {
+            let absolute = started_at + chrono::Duration::milliseconds(utterance.start_ms as i64);
+            serde_json::json!({
+                "start_ms": utterance.start_ms,
+                "end_ms": utterance.end_ms,
+                "start_iso": absolute.to_rfc3339(),
+                "speaker": utterance.speaker,
+                "text": utterance.text,
+            })
+        })
+        .collect();
+
     let payload = serde_json::json!({
+        "schema": SCHEMA_VERSION,
+        "meeting_id": meeting_id(source_app, started_at),
         "source_app": source_app,
         "other_party": other_party,
         "started_at": started_at.to_rfc3339(),
         "ended_at": ended_at.to_rfc3339(),
         "duration_seconds": ended_at.signed_duration_since(started_at).num_seconds().max(0),
         "transcript_file": markdown_path.file_name().map(|name| name.to_string_lossy().to_string()),
-        "utterances": utterances,
+        "utterances": timed,
     });
 
     let body = serde_json::to_string_pretty(&payload)
@@ -203,6 +242,9 @@ pub fn append_index(
     let index = dir.join("index.jsonl");
 
     let entry = serde_json::json!({
+        "schema": SCHEMA_VERSION,
+        "meeting_id": meeting_id(source_app, started_at),
+        "event": "meeting",
         "started_at": started_at.to_rfc3339(),
         "ended_at": ended_at.to_rfc3339(),
         "duration_seconds": ended_at.signed_duration_since(started_at).num_seconds().max(0),
@@ -229,7 +271,10 @@ pub fn append_index(
 /// Written as a separate step on purpose: the transcript and its timings are
 /// saved before any model is asked anything, so a model that is unreachable,
 /// slow or wrong can never cost the recording itself.
-pub fn attach_analysis(sidecar: &PathBuf, raw_model_output: &str) -> Result<(), String> {
+pub fn attach_analysis(
+    sidecar: &PathBuf,
+    raw_model_output: &str,
+) -> Result<serde_json::Value, String> {
     let existing = std::fs::read_to_string(sidecar)
         .map_err(|e| format!("Failed to read {}: {}", sidecar.display(), e))?;
     let mut payload: serde_json::Value = serde_json::from_str(&existing)
@@ -254,11 +299,94 @@ pub fn attach_analysis(sidecar: &PathBuf, raw_model_output: &str) -> Result<(), 
         },
     };
 
-    payload["analysis"] = analysis;
+    payload["analysis"] = analysis.clone();
 
     let body = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("Could not serialise sidecar: {}", e))?;
     std::fs::write(sidecar, body)
         .map_err(|e| format!("Failed to write {}: {}", sidecar.display(), e))?;
+    Ok(analysis)
+}
+
+/// Append the extraction result to the index as a second line for the same
+/// meeting, so a reader can find what a meeting was about without opening its
+/// sidecar.
+///
+/// The index stays append-only: nothing is rewritten, and a later line simply
+/// carries more about a meeting already recorded.
+pub fn append_index_analysis(
+    app_handle: &tauri::AppHandle,
+    meeting_id: &str,
+    analysis: &serde_json::Value,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let dir =
+        transcripts_dir(app_handle).ok_or_else(|| "Could not resolve app data dir".to_string())?;
+    let index = dir.join("index.jsonl");
+
+    let summary = analysis.get("summary").and_then(|value| value.as_str());
+    let decisions = analysis
+        .get("decisions")
+        .and_then(|value| value.as_array())
+        .map(|items| items.len())
+        .unwrap_or(0);
+
+    let entry = serde_json::json!({
+        "schema": SCHEMA_VERSION,
+        "meeting_id": meeting_id,
+        "event": "analysis",
+        "summary": summary,
+        "decisions": decisions,
+    });
+
+    let line = serde_json::to_string(&entry)
+        .map_err(|e| format!("Could not serialise index entry: {}", e))?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index)
+        .map_err(|e| format!("Failed to open {}: {}", index.display(), e))?;
+    writeln!(file, "{}", line).map_err(|e| format!("Failed to write {}: {}", index.display(), e))?;
     Ok(())
+}
+
+/// Finish transcripts left behind by a recording that never stopped cleanly.
+///
+/// A `.partial.md` file means the process died mid-meeting. Rather than leave
+/// it as a half-file nobody reads, promote it to a normal transcript marked as
+/// interrupted and record it in the index, so the meeting is still there.
+pub fn recover_interrupted(app_handle: &tauri::AppHandle) {
+    let Some(dir) = transcripts_dir(app_handle) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+        let Some(name) = name else { continue };
+        if !name.ends_with(".partial.md") {
+            continue;
+        }
+
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let stem = name.trim_end_matches(".partial.md").to_string();
+        let recovered = dir.join(format!("{}-interrupted.md", stem));
+
+        let annotated = body.replace(
+            "This meeting is still being recorded. The finished transcript replaces\nthis file when it ends.",
+            "This recording was interrupted - the application stopped before the\nmeeting ended. What follows is everything that had been transcribed.",
+        );
+
+        if std::fs::write(&recovered, annotated).is_ok() {
+            let _ = std::fs::remove_file(&path);
+            info!("Recovered an interrupted transcript as {}", recovered.display());
+        }
+    }
 }

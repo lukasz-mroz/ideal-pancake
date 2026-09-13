@@ -253,10 +253,24 @@ data\transcripts\
 ```
 
 The `.json` companion lists every stretch of speech with `start_ms`, `end_ms`,
-`speaker` and `text`, timed against the start of the recording using the audio
-clock rather than wall time - so the timings hold even when transcription lags
-behind the conversation. A model asked "what was agreed near the end" filters
-on timestamps instead of reading the whole transcript.
+`start_iso`, `speaker` and `text`. Timings come from whisper's own segment
+boundaries, so they are per sentence rather than per three-second chunk, and
+they are measured on the audio clock rather than wall time - they hold even
+when transcription lags behind the conversation. `start_iso` gives the same
+moment as a wall-clock time, so joining a transcript with anything else from
+that day needs no arithmetic.
+
+Pieces split by a chunk boundary are stitched back together: the same speaker,
+a gap under 400 ms and a previous line that does not end in sentence
+punctuation means one utterance that got cut, not two.
+
+Every file carries a `meeting_id` (start time plus a hash of the source) and a
+`schema` number. Filenames are not identity - two meetings can start in the
+same minute and files get renamed - so anything cross-referencing meetings
+should join on `meeting_id`.
+
+The Markdown transcript marks each change of speaker with `[mm:ss]`, so a
+reader or a model can point at a moment in the recording.
 
 Once the transcript is safely on disk, a model is asked to pull the meeting
 apart into `decisions`, `action_items`, `topics` and `open_questions`, and the
@@ -272,8 +286,11 @@ analysed beats a meeting lost to an unavailable model. Hosted models are
 noticeably better at this than a small local one, so `local` is the private
 default rather than the accurate one.
 
-`index.jsonl` gets one appended line per meeting: times, duration, source,
-other party, word count and the transcript's filename. A folder of several
+`index.jsonl` gets an appended line per meeting (`"event": "meeting"`) with
+times, duration, source, other party, word count and the transcript's
+filename, and a second line once the analysis finishes (`"event": "analysis"`)
+carrying the summary and how many decisions were found. The file is only ever
+appended to, so a later line adds to a meeting rather than rewriting it. A folder of several
 hundred transcripts stays searchable without opening any of them.
 
 ### While a meeting runs
@@ -281,8 +298,12 @@ hundred transcripts stays searchable without opening any of them.
 The transcript is written to `data\transcripts\<time>.partial.md` every few
 seconds and replaced by the finished file when the meeting ends. A crash, a
 power cut or a killed process therefore costs the last few seconds rather than
-the whole meeting - a `.partial.md` left behind is a meeting that never
-finished cleanly.
+the whole meeting.
+
+On the next start, any `.partial.md` still lying around is promoted to
+`<time>-interrupted.md` with a note saying the recording was cut short - a
+meeting that ended badly still ends up readable instead of sitting there as a
+half-file.
 
 Captured audio is released as soon as Whisper has read it; nothing keeps the
 recording in memory for the length of the meeting.

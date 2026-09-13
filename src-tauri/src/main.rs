@@ -259,6 +259,10 @@ async fn main() {
             setup_keypress_listener(&app_handle);
             seed_default_settings(&app_handle);
 
+            // A .partial.md left over means a recording that never stopped
+            // cleanly; turn it into a transcript rather than leaving it.
+            engine::transcript_export::recover_interrupted(&app_handle);
+
             // `Platypus.exe --self-test` checks the capture chain and exits,
             // so a freshly installed machine can be verified without waiting
             // for a real meeting.
@@ -982,7 +986,7 @@ async fn stop_audio_recording(app_handle: AppHandle, use_local: bool) -> Result<
         if !remaining.is_empty() {
             if let Some(text) = process_and_transcribe_chunk(&remaining) {
                 let mut t = ACCUMULATED_TRANSCRIPT.lock().unwrap();
-                append_with_speaker(&mut t, &text);
+                append_tail(&mut t, 0, &text);
             }
         }
         // Emit final transcript
@@ -1120,8 +1124,20 @@ pub(crate) fn auto_record_stop(app_handle: AppHandle, app_name: String) {
         let remaining = engine::audio_engine::drain_all_samples();
         if !remaining.is_empty() {
             if let Some(text) = process_and_transcribe_chunk(&remaining) {
+                let elapsed_ms = {
+                    let meta = AUTO_RECORD_META.lock().unwrap();
+                    meta.as_ref()
+                        .map(|(_, started)| {
+                            chrono::Local::now()
+                                .signed_duration_since(*started)
+                                .num_milliseconds()
+                                .max(0) as u64
+                        })
+                        .unwrap_or(0)
+                };
                 let mut transcript = ACCUMULATED_TRANSCRIPT.lock().unwrap();
-                append_with_speaker(&mut transcript, &text);
+                append_tail(&mut transcript, elapsed_ms, &text);
+                record_utterance(elapsed_ms, elapsed_ms, "Unknown", &text);
             }
         }
 
@@ -1174,7 +1190,12 @@ pub(crate) fn auto_record_stop(app_handle: AppHandle, app_name: String) {
                 ) {
                     Ok(sidecar) => {
                         info!("Auto-capture: timings saved to {}", sidecar.display());
-                        analyse_meeting(app_handle.clone(), sidecar, text.clone());
+                        analyse_meeting(
+                            app_handle.clone(),
+                            sidecar,
+                            engine::transcript_export::meeting_id(&source_app, started_at),
+                            text.clone(),
+                        );
                     }
                     Err(err) => log::warn!("Auto-capture: could not write timings: {}", err),
                 }
@@ -1207,7 +1228,12 @@ pub(crate) fn auto_record_stop(app_handle: AppHandle, app_name: String) {
 /// Runs after the transcript is on disk, and failure is logged rather than
 /// propagated: a meeting that was captured but not analysed is a far better
 /// outcome than losing it because a model was unavailable.
-fn analyse_meeting(app_handle: AppHandle, sidecar: std::path::PathBuf, transcript: String) {
+fn analyse_meeting(
+    app_handle: AppHandle,
+    sidecar: std::path::PathBuf,
+    meeting_id: String,
+    transcript: String,
+) {
     tauri::async_runtime::spawn(async move {
         let provider = app_handle
             .db(|db| get_setting(db, "post_meeting_analysis"))
@@ -1233,7 +1259,16 @@ fn analyse_meeting(app_handle: AppHandle, sidecar: std::path::PathBuf, transcrip
         .await
         {
             Ok(output) => match engine::transcript_export::attach_analysis(&sidecar, &output) {
-                Ok(()) => info!("Auto-capture: analysis added to {}", sidecar.display()),
+                Ok(analysis) => {
+                    info!("Auto-capture: analysis added to {}", sidecar.display());
+                    if let Err(err) = engine::transcript_export::append_index_analysis(
+                        &app_handle,
+                        &meeting_id,
+                        &analysis,
+                    ) {
+                        log::warn!("Auto-capture: could not index the analysis: {}", err);
+                    }
+                }
                 Err(err) => log::warn!("Auto-capture: could not attach analysis: {}", err),
             },
             Err(err) => log::warn!("Auto-capture: analysis failed: {}", err),
@@ -1397,6 +1432,54 @@ pub(crate) fn transcribe_samples_for_test(raw_samples: &[f32]) -> Option<String>
 /// that were said.
 const SILENCE_RMS: f32 = 0.004;
 
+/// Transcribe a chunk and keep whisper's segment timings, offset so they are
+/// relative to the whole recording rather than to the chunk.
+fn process_and_transcribe_segments(
+    raw_samples: &[f32],
+    chunk_start_ms: u64,
+) -> Vec<engine::whisper_engine::Segment> {
+    use crate::engine::audio_processor::resample;
+
+    let device_rate = crate::engine::audio_engine::DEVICE_SAMPLE_RATE
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if device_rate == 0 || raw_samples.is_empty() {
+        return Vec::new();
+    }
+
+    let rms = (raw_samples.iter().map(|s| s * s).sum::<f32>() / raw_samples.len() as f32).sqrt();
+    if rms < SILENCE_RMS {
+        return Vec::new();
+    }
+
+    let samples_16k = match resample(raw_samples, device_rate, 16000) {
+        Ok(samples) => samples,
+        Err(err) => {
+            log::warn!("Resample to 16kHz failed: {}", err);
+            return Vec::new();
+        }
+    };
+
+    let guard = WHISPER_ENGINE.lock().unwrap();
+    let Some(engine) = guard.as_ref() else {
+        log::warn!("Whisper engine not initialized");
+        return Vec::new();
+    };
+
+    match engine.transcribe_segments(&samples_16k) {
+        Ok(mut segments) => {
+            for segment in &mut segments {
+                segment.start_ms += chunk_start_ms;
+                segment.end_ms += chunk_start_ms;
+            }
+            segments
+        }
+        Err(err) => {
+            log::warn!("Whisper transcription error: {}", err);
+            Vec::new()
+        }
+    }
+}
+
 fn process_and_transcribe_chunk(raw_samples: &[f32]) -> Option<String> {
     use crate::engine::audio_processor::resample;
 
@@ -1450,9 +1533,16 @@ fn others_label() -> String {
     OTHERS_LABEL.lock().unwrap().clone()
 }
 
-/// Append text under a speaker heading, starting a new paragraph only when the
-/// speaker changes.
-fn append_labelled(transcript: &mut String, label: &str, text: &str) {
+/// Format a position in the recording as [mm:ss], so both a reader and a model
+/// can point at a moment.
+fn timestamp_label(position_ms: u64) -> String {
+    let total_seconds = position_ms / 1000;
+    format!("[{:02}:{:02}]", total_seconds / 60, total_seconds % 60)
+}
+
+/// Append text under a speaker heading, starting a new paragraph - with a
+/// timestamp - only when the speaker changes.
+fn append_labelled(transcript: &mut String, label: &str, position_ms: u64, text: &str) {
     let mut last = LAST_SPEAKER.lock().unwrap();
     if last.as_deref() == Some(label) {
         if !transcript.is_empty() {
@@ -1462,68 +1552,81 @@ fn append_labelled(transcript: &mut String, label: &str, text: &str) {
         if !transcript.is_empty() {
             transcript.push_str("\n\n");
         }
-        transcript.push_str(&format!("**{}:** ", label));
+        transcript.push_str(&format!("{} **{}:** ", timestamp_label(position_ms), label));
         *last = Some(label.to_string());
     }
     transcript.push_str(text);
 }
 
-/// Append transcribed text, labelled with whoever was louder while it was
-/// recorded.
-///
-/// Labels only appear when system audio is being captured - with the
-/// microphone alone there is no second side to compare against, and a label
-/// would be a guess dressed up as a fact.
-fn append_with_speaker(transcript: &mut String, text: &str) -> String {
+/// Append text with no speaker attribution - used when system audio is off and
+/// there is nothing to compare the microphone against.
+fn append_plain(transcript: &mut String, text: &str) {
+    if !transcript.is_empty() {
+        transcript.push(' ');
+    }
+    transcript.push_str(text);
+}
+
+/// Append the last scrap of audio transcribed after a recording stops.
+fn append_tail(transcript: &mut String, position_ms: u64, text: &str) {
+    match speaker_label_for_chunk() {
+        Some(label) => append_labelled(transcript, &label, position_ms, text),
+        None => append_plain(transcript, text),
+    }
+}
+
+/// Which side was louder over the chunk just processed, as a label.
+fn speaker_label_for_chunk() -> Option<String> {
     use crate::engine::audio_engine::SpeakerHint;
 
     let others = others_label();
-    let label = match crate::engine::audio_engine::take_speaker_hint() {
+    match crate::engine::audio_engine::take_speaker_hint() {
         SpeakerHint::Me => Some("Me".to_string()),
-        SpeakerHint::Others => Some(others.clone()),
+        SpeakerHint::Others => Some(others),
         SpeakerHint::Both => Some(format!("Me + {}", others.to_lowercase())),
         SpeakerHint::Unknown => None,
-    };
-
-    let used = label.clone();
-    match label {
-        Some(label) => {
-            let mut last = LAST_SPEAKER.lock().unwrap();
-            let same_speaker = last.as_deref() == Some(label.as_str());
-            if same_speaker {
-                if !transcript.is_empty() {
-                    transcript.push(' ');
-                }
-            } else {
-                if !transcript.is_empty() {
-                    transcript.push_str("\n\n");
-                }
-                transcript.push_str(&format!("**{}:** ", label));
-                *last = Some(label.clone());
-            }
-        }
-        None => {
-            if !transcript.is_empty() {
-                transcript.push(' ');
-            }
-        }
     }
-
-    transcript.push_str(text);
-    used.unwrap_or_else(|| "Unknown".to_string())
 }
 
 /// Note a transcribed stretch of speech with its place in the recording.
+///
+/// Consecutive pieces from the same speaker are merged when the break looks
+/// like an artefact of chunking rather than a pause: audio is cut every few
+/// seconds regardless of where sentences fall, and a sentence split across two
+/// chunks would otherwise arrive as two utterances broken mid-clause.
 fn record_utterance(start_ms: u64, end_ms: u64, speaker: &str, text: &str) {
     if !AUTO_RECORDING.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
+
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+
     let mut utterances = AUTO_UTTERANCES.lock().unwrap();
+
+    if let Some(previous) = utterances.last_mut() {
+        let same_speaker = previous.speaker == speaker;
+        let gap_ms = start_ms.saturating_sub(previous.end_ms);
+        let unfinished = !previous
+            .text
+            .trim_end()
+            .ends_with(['.', '!', '?', '…', ':']);
+
+        if same_speaker && gap_ms < 400 && unfinished {
+            previous.text.push(' ');
+            previous.text.push_str(text);
+            previous.end_ms = end_ms.max(previous.end_ms);
+            return;
+        }
+    }
+
     utterances.push(engine::transcript_export::Utterance {
         start_ms,
         end_ms,
         speaker: speaker.to_string(),
-        text: text.trim().to_string(),
+        text: text.to_string(),
     });
 }
 
@@ -1618,18 +1721,45 @@ async fn realtime_transcription_loop(app_handle: AppHandle) {
                     if samples.is_empty() {
                         continue;
                     }
-                    if let Some(text) = process_and_transcribe_chunk(samples) {
+                    for segment in process_and_transcribe_segments(samples, start_ms) {
                         let mut t = transcript_arc.lock().unwrap();
-                        append_labelled(&mut t, label, &text);
-                        record_utterance(start_ms, end_ms, label, &text);
+                        append_labelled(&mut t, label, segment.start_ms, &segment.text);
+                        record_utterance(segment.start_ms, segment.end_ms, label, &segment.text);
                         updated = true;
                     }
                 }
-            } else if let Some(text) = process_and_transcribe_chunk(&chunk) {
-                let mut t = transcript_arc.lock().unwrap();
-                let label = append_with_speaker(&mut t, &text);
-                record_utterance(start_ms, end_ms, &label, &text);
-                updated = true;
+            } else {
+                let segments = process_and_transcribe_segments(&chunk, start_ms);
+                if !segments.is_empty() {
+                    // One reading of the loudness balance for the whole chunk:
+                    // the sides were measured over that window, not per
+                    // sentence.
+                    let label = speaker_label_for_chunk();
+                    for segment in segments {
+                        let mut t = transcript_arc.lock().unwrap();
+                        match &label {
+                            Some(label) => {
+                                append_labelled(&mut t, label, segment.start_ms, &segment.text);
+                                record_utterance(
+                                    segment.start_ms,
+                                    segment.end_ms,
+                                    label,
+                                    &segment.text,
+                                );
+                            }
+                            None => {
+                                append_plain(&mut t, &segment.text);
+                                record_utterance(
+                                    segment.start_ms,
+                                    segment.end_ms,
+                                    "Unknown",
+                                    &segment.text,
+                                );
+                            }
+                        }
+                        updated = true;
+                    }
+                }
             }
 
             if updated {
