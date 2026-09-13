@@ -233,10 +233,13 @@ async fn main() {
                 configuration::portable::is_portable(),
                 app_data_dir.display()
             );
-            // Screenshot/task-mining scaffolding is off unless asked for: it
-            // creates directories and a cleanup pass for a feature this build
-            // does not use, and it is the last thing wanted in a folder that
-            // holds meeting recordings.
+            // The database must exist before any setting is read: `.db()`
+            // unwraps the connection, so reading a setting before this line
+            // panics on startup.
+            setup_keypress_listener(&app_handle);
+            seed_default_settings(&app_handle);
+
+            // Screenshot/task-mining scaffolding is off unless asked for.
             let task_mining = app_handle
                 .db(|db| get_setting(db, "task_mining_enabled"))
                 .map(|setting| setting.setting_value)
@@ -256,8 +259,6 @@ async fn main() {
             if task_mining {
                 clean_up(app_data_dir.clone());
             }
-            setup_keypress_listener(&app_handle);
-            seed_default_settings(&app_handle);
 
             // A .partial.md left over means a recording that never stopped
             // cleanly; turn it into a transcript rather than leaving it.
