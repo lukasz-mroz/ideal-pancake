@@ -54,6 +54,87 @@ fn suppress_whisper_logs() {
     });
 }
 
+lazy_static::lazy_static! {
+    /// Language passed to whisper.cpp: a code like "pl", or "auto".
+    static ref LANGUAGE: std::sync::Mutex<String> = std::sync::Mutex::new("auto".to_string());
+
+    /// Language detected for the recording in progress.
+    ///
+    /// Detection runs on each chunk of audio, and these chunks are ~3 seconds
+    /// long - far too short to decide reliably, so consecutive chunks of one
+    /// meeting can come back as different languages and the transcript turns
+    /// into a mix. Instead, detect once on the first chunk that carries real
+    /// speech and hold that for the rest of the recording.
+    static ref DETECTED_LANGUAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+}
+
+/// Forget the detected language. Called when a recording starts, so the next
+/// meeting detects again instead of inheriting the previous one.
+pub fn reset_detected_language() {
+    let mut detected = DETECTED_LANGUAGE.lock().unwrap();
+    *detected = None;
+}
+
+/// Set from the `transcription_language` setting at startup.
+pub fn set_language(language: &str) {
+    let normalised = language.trim().to_ascii_lowercase();
+    let mut current = LANGUAGE.lock().unwrap();
+    *current = if normalised.is_empty() {
+        "auto".to_string()
+    } else {
+        normalised
+    };
+    info!("Transcription language: {}", current);
+}
+
+/// What to hand whisper.cpp for the next chunk: the configured language, the
+/// one already detected for this recording, or "auto" until that happens.
+fn language() -> String {
+    let configured = LANGUAGE.lock().unwrap().clone();
+    if configured != "auto" {
+        return configured;
+    }
+    if let Some(detected) = DETECTED_LANGUAGE.lock().unwrap().clone() {
+        return detected;
+    }
+    "auto".to_string()
+}
+
+/// Remember the language whisper.cpp settled on, once a chunk carried enough
+/// speech for the answer to mean something.
+fn remember_detected_language(state: &whisper_rs::WhisperState, text: &str) {
+    if text.trim().chars().count() < 20 {
+        return;
+    }
+    {
+        let detected = DETECTED_LANGUAGE.lock().unwrap();
+        if detected.is_some() {
+            return;
+        }
+    }
+
+    // Older whisper-rs releases spell this `full_lang_id`.
+    if let Ok(id) = state.full_lang_id_from_state() {
+        if let Some(code) = whisper_rs::get_lang_str(id) {
+            let mut detected = DETECTED_LANGUAGE.lock().unwrap();
+            *detected = Some(code.to_string());
+            info!("Detected spoken language: {} - keeping it for this recording", code);
+        }
+    }
+}
+
+/// Threads for inference. whisper.cpp scales with physical cores and then
+/// flattens out; four was hard-coded here, which left most of a modern laptop
+/// unused.
+fn inference_threads() -> std::os::raw::c_int {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // Leave a little room for the audio thread and the UI process.
+    let threads = if available > 2 { available - 1 } else { available };
+    threads.clamp(1, 8) as std::os::raw::c_int
+}
+
 pub fn model_dir() -> PathBuf {
     crate::configuration::portable::models_dir()
 }
@@ -160,8 +241,12 @@ impl WhisperEngine {
         let mut state = self.ctx.create_state()
             .map_err(|e| anyhow!("Failed to create whisper state: {:?}", e))?;
 
+        // Declared before `params` on purpose: FullParams borrows this string,
+        // so it has to outlive it.
+        let language = language();
+
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(Some("en"));
+        params.set_language(Some(&language));
         params.set_translate(false);
         params.set_single_segment(true);
         params.set_no_timestamps(true);
@@ -170,7 +255,7 @@ impl WhisperEngine {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
-        params.set_n_threads(4);
+        params.set_n_threads(inference_threads());
 
         state.full(params, samples_16k)
             .map_err(|e| anyhow!("Whisper inference failed: {:?}", e))?;
@@ -186,6 +271,11 @@ impl WhisperEngine {
             }
         }
 
-        Ok(text.trim().to_string())
+        let text = text.trim().to_string();
+        if language == "auto" {
+            remember_detected_language(&state, &text);
+        }
+
+        Ok(text)
     }
 }

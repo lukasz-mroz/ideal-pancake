@@ -102,6 +102,9 @@ For a signed + notarized macOS build that uploads to your S3 bucket, see [`scrip
 
 ### Windows portable build
 
+Setting this up on a fresh Windows machine, or handing the job to an agent? [`AGENTS.md`](AGENTS.md) is the runbook: installing the toolchain, building, and updating an existing installation without touching the `data` folder it has collected.
+
+
 A no-installer Windows build that keeps all data next to the executable — see [`docs/WINDOWS-PORTABLE.md`](docs/WINDOWS-PORTABLE.md). Build it in CI via the *Windows portable build* workflow, or locally:
 
 ```powershell

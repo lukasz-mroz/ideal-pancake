@@ -76,6 +76,102 @@ VRAM is the practical limit: `large-v3` in fp16 needs about 3.1 GB, which is
 tight on a 4 GB card that is also driving the desktop. `large-v3-turbo`
 (~1.6 GB) is the safe default there.
 
+## Meeting capture
+
+With the app running (tray icon, window optional) it records meetings on its
+own:
+
+1. Detection polls for Teams and Zoom. On Windows "in a meeting" means the app
+   currently holds the microphone, read from the same registry data behind
+   Windows' own microphone indicator
+   (`CapabilityAccessManager\ConsentStore\microphone`, where
+   `LastUsedTimeStop = 0` means in use right now).
+2. When a meeting starts, recording begins without a prompt and transcription
+   runs locally through Whisper.
+3. When the meeting ends, the transcript is written to `data\transcripts\` as
+   `2026-09-13_15-42_microsoft-teams.md`, with source, times, duration and word
+   count in the header - so another tool can read meetings off the filesystem
+   without touching the database.
+
+### Both sides of the call
+
+Recording only the microphone captures your own voice and nothing else, so on
+Windows the app also captures what the speakers play (WASAPI loopback) and
+mixes it into the same stream before transcription. `cpal` has no loopback
+mode, so that part talks to WASAPI directly; see
+`src-tauri/src/engine/loopback_capture.rs`.
+
+Set `capture_system_audio` to `false` to record the microphone only. The value
+is read at startup, so a change takes effect on the next run. On macOS the
+setting does nothing - the system has no loopback endpoint to open, and
+capturing output there needs a virtual audio device.
+
+### Language
+
+Transcription used to be hard-wired to English, which turns any other language
+into phonetic nonsense. The `transcription_language` setting now drives it:
+a code (`pl`, `en`, `de`) forces one language, `auto` detects.
+
+`auto` detects **once per recording**, not per chunk. Chunks here are about
+three seconds - too short to decide reliably - so per-chunk detection lets one
+meeting come back as a mix of languages. Instead the first chunk carrying real
+speech decides, and that language holds until the recording stops.
+
+For meetings that are in one language but sprinkled with borrowed terms
+(Polish with English jargon, say), forcing the base language beats `auto`: the
+model still writes the foreign words in Latin script, and you avoid a
+mid-meeting switch. Use `auto` when whole meetings differ in language.
+
+Inference threads follow the machine instead of a hard-coded four.
+
+### What a captured meeting produces
+
+- `data\transcripts\<date>_<app>.md` - the file other tools read
+- a note in the Unassigned project, so the app's own search and chat can see
+  the meeting too
+
+On first run the app seeds the settings this depends on:
+`use_local_transcription`, `whisper_model`, `meeting_detection_enabled`,
+`auto_capture_meetings`, `capture_system_audio`, `transcription_language`,
+`vectorization_enabled` and `rag_top_k`. Settings you
+have already chosen are never overwritten.
+
+The app does not add itself to Windows startup; put a shortcut in the Startup
+folder yourself if you want it running all the time. It takes `--minimized` to
+start hidden in the tray.
+
+To be asked before recording, set `auto_capture_meetings` to `false` - the
+popup-and-banner path returns. `meeting_detection_enabled: false` stops the
+detection thread altogether. A recording started by hand is never stopped by a
+meeting ending: the automatic path only stops what it started.
+
+Screenshot/task-mining scaffolding stays off unless `task_mining_enabled` is
+`true`; it creates directories and a cleanup pass for a feature this build does
+not use.
+
+Everyone on the call is a participant in this recording. Whether they are told
+is your call, not the software's.
+
+## Updating an installation
+
+Every package carries `VERSION.txt` (version, git commit, flavour, build date),
+so it is possible to tell what a machine is running. To update it:
+
+```powershell
+git pull
+scripts\build-portable.cmd
+powershell -ExecutionPolicy Bypass -File scripts\update-portable.ps1 -Target D:\Platypus
+```
+
+`update-portable.ps1` replaces everything except `data\` - the database,
+transcripts, models and settings stay as they are. It refuses to write while
+Platypus is running; `-StopRunning` closes it first, which must not be done
+while a meeting is being recorded, since the recording only reaches disk when
+the meeting ends.
+
+A bundled Whisper model is copied in only when the installation has none, so an
+update never re-downloads or overwrites gigabytes that are already there.
+
 ## Helper scripts inside the package
 
 Every package carries two small scripts, run from the unpacked folder:

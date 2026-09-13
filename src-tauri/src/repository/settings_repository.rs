@@ -25,17 +25,35 @@ pub fn insert_or_update_setting(db: &Connection, setting: Setting) -> Result<(),
     Ok(())
 }
 
+/// Read one setting. A missing row yields an empty value, which callers treat
+/// as "not configured".
+///
+/// Anything other than a missing row is logged: a failing database used to be
+/// indistinguishable from an unset option, which is how a feature can look
+/// enabled in the UI while never running.
 pub fn get_setting(db: &Connection, setting_key: &str) -> Result<Setting, rusqlite::Error> {
-    let row = db.query_row("SELECT * FROM settings WHERE setting_key = @setting_key LIMIT 1",
-                           named_params! {
-                                "@setting_key": setting_key,
-                           },
-                           Setting::try_from_row).unwrap_or(
-        Setting {
+    let row = db.query_row(
+        "SELECT * FROM settings WHERE setting_key = @setting_key LIMIT 1",
+        named_params! {
+            "@setting_key": setting_key,
+        },
+        Setting::try_from_row,
+    );
+
+    match row {
+        Ok(setting) => Ok(setting),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Setting {
             setting_key: setting_key.to_string(),
-            setting_value: "".to_string(),
-        });
-    return Ok(row);
+            setting_value: String::new(),
+        }),
+        Err(err) => {
+            log::warn!("Could not read setting {}: {}", setting_key, err);
+            Ok(Setting {
+                setting_key: setting_key.to_string(),
+                setting_value: String::new(),
+            })
+        }
+    }
 }
 
 pub fn get_settings(db: &Connection) -> Result<Vec<Setting>, rusqlite::Error> {

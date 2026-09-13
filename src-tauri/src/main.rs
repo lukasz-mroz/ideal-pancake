@@ -233,7 +233,18 @@ async fn main() {
                 configuration::portable::is_portable(),
                 app_data_dir.display()
             );
-            let _ = setup_directories::setup_dirs(app_data_dir.to_str().unwrap());
+            // Screenshot/task-mining scaffolding is off unless asked for: it
+            // creates directories and a cleanup pass for a feature this build
+            // does not use, and it is the last thing wanted in a folder that
+            // holds meeting recordings.
+            let task_mining = app_handle
+                .db(|db| get_setting(db, "task_mining_enabled"))
+                .map(|setting| setting.setting_value)
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("true");
+            if task_mining {
+                let _ = setup_directories::setup_dirs(app_data_dir.to_str().unwrap());
+            }
             prerequisites::check_and_install_prerequisites(
                 app_handle
                     .path_resolver()
@@ -242,8 +253,28 @@ async fn main() {
                     .to_str()
                     .unwrap(),
             );
-            clean_up(app_data_dir.clone());
+            if task_mining {
+                clean_up(app_data_dir.clone());
+            }
             setup_keypress_listener(&app_handle);
+            seed_default_settings(&app_handle);
+
+            let language = app_handle
+                .db(|db| get_setting(db, "transcription_language"))
+                .map(|setting| setting.setting_value)
+                .unwrap_or_default();
+            engine::whisper_engine::set_language(&language);
+
+            // System audio capture is read once at startup; changing it takes
+            // effect on the next run.
+            let capture_system_audio = app_handle
+                .db(|db| get_setting(db, "capture_system_audio"))
+                .map(|setting| setting.setting_value)
+                .unwrap_or_default();
+            engine::audio_engine::CAPTURE_SYSTEM_AUDIO.store(
+                !capture_system_audio.eq_ignore_ascii_case("false"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
 
             // Load meeting detection setting from DB and start the detector thread
             let detection_enabled = app_handle.db(|db| {
@@ -276,6 +307,54 @@ fn setup_keypress_listener(app_handle: &AppHandle) {
     let db: Connection =
         database::initialize_database(&app_handle).expect("Database initialization failed!");
     *app_state.db.lock().unwrap() = Some(db);
+}
+
+/// Seed the settings a headless capture build depends on, the first time it
+/// runs. Only missing keys are written - anything the user has already chosen
+/// is left alone.
+fn seed_default_settings(app_handle: &AppHandle) {
+    const DEFAULTS: [(&str, &str); 8] = [
+        // Transcribe on this machine: an unattended capture cannot depend on
+        // an API key being present.
+        ("use_local_transcription", "true"),
+        ("whisper_model", "large-v3-turbo"),
+        ("meeting_detection_enabled", "true"),
+        ("auto_capture_meetings", "true"),
+        // Record the speakers as well as the microphone - without it a call
+        // transcript is only your own half of the conversation.
+        ("capture_system_audio", "true"),
+        // "auto" detects per chunk; set a code like "pl" when you know what
+        // will be spoken - detection costs accuracy on short chunks.
+        ("transcription_language", "auto"),
+        ("vectorization_enabled", "true"),
+        // 20 chunks of 4000 characters is ~25k tokens per question, which
+        // overflows a local model's context and dilutes retrieval for a
+        // hosted one.
+        ("rag_top_k", "12"),
+    ];
+
+    for (key, value) in DEFAULTS {
+        let existing = app_handle
+            .db(|db| get_setting(db, key))
+            .map(|setting| setting.setting_value)
+            .unwrap_or_default();
+
+        if existing.trim().is_empty() {
+            let result = app_handle.db(|db| {
+                insert_or_update_setting(
+                    db,
+                    Setting {
+                        setting_key: key.to_string(),
+                        setting_value: value.to_string(),
+                    },
+                )
+            });
+            match result {
+                Ok(()) => info!("Seeded default setting {} = {}", key, value),
+                Err(err) => log::warn!("Could not seed setting {}: {}", key, err),
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -810,6 +889,7 @@ fn prompt_for_accessibility_permissions() {
 async fn start_audio_recording(app_handle: AppHandle, use_local: bool) -> Result<String, String> {
     if use_local {
         crate::engine::audio_engine::start_recording_local().await?;
+        engine::whisper_engine::reset_detected_language();
         // Clear accumulated transcript
         {
             let mut t = ACCUMULATED_TRANSCRIPT.lock().unwrap();
@@ -858,6 +938,162 @@ async fn stop_audio_recording(app_handle: AppHandle, use_local: bool) -> Result<
     } else {
         crate::engine::audio_engine::stop_recording().await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unattended meeting capture
+//
+// When meeting detection fires, recording starts on its own - no window, no
+// popup, no click - and stops when the meeting ends. The transcript is written
+// to `<app data>/transcripts` as Markdown so other tools can pick it up
+// without going through the database.
+// ---------------------------------------------------------------------------
+
+static AUTO_RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+lazy_static! {
+    /// (source app, start time) of the recording in progress, if any.
+    static ref AUTO_RECORD_META: Arc<std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Local>)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+}
+
+/// Capture meetings without asking. Defaults to on: a build that runs hidden
+/// in the tray has nobody to ask.
+pub(crate) fn auto_capture_enabled(app_handle: &AppHandle) -> bool {
+    let value = app_handle
+        .db(|db| get_setting(db, "auto_capture_meetings"))
+        .map(|s| s.setting_value)
+        .unwrap_or_default();
+
+    match value.trim() {
+        "" => true,
+        other => other.eq_ignore_ascii_case("true"),
+    }
+}
+
+pub(crate) fn auto_record_start(app_handle: AppHandle, app_name: String) {
+    tauri::async_runtime::spawn(async move {
+        use std::sync::atomic::Ordering;
+
+        if engine::audio_engine::IS_RECORDING.load(Ordering::SeqCst) {
+            info!("Auto-capture: already recording, ignoring {}", app_name);
+            return;
+        }
+
+        if let Err(err) = engine::audio_engine::start_recording_local().await {
+            log::warn!("Auto-capture: could not start recording: {}", err);
+            return;
+        }
+
+        engine::whisper_engine::reset_detected_language();
+        {
+            let mut transcript = ACCUMULATED_TRANSCRIPT.lock().unwrap();
+            transcript.clear();
+        }
+        {
+            let mut meta = AUTO_RECORD_META.lock().unwrap();
+            *meta = Some((app_name.clone(), chrono::Local::now()));
+        }
+        AUTO_RECORDING.store(true, Ordering::SeqCst);
+        info!("Auto-capture: recording started for {}", app_name);
+
+        let handle = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            realtime_transcription_loop(handle).await;
+        });
+    });
+}
+
+pub(crate) fn auto_record_stop(app_handle: AppHandle, app_name: String) {
+    tauri::async_runtime::spawn(async move {
+        use std::sync::atomic::Ordering;
+
+        // Only stop what we started - a recording the user began by hand must
+        // not be cut short because a meeting ended.
+        if !AUTO_RECORDING.swap(false, Ordering::SeqCst) {
+            return;
+        }
+
+        if let Err(err) = engine::audio_engine::stop_recording_local().await {
+            log::warn!("Auto-capture: stop failed: {}", err);
+        }
+
+        // Let the realtime loop notice IS_RECORDING went false.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let remaining = engine::audio_engine::drain_all_samples();
+        if !remaining.is_empty() {
+            if let Some(text) = process_and_transcribe_chunk(&remaining) {
+                let mut transcript = ACCUMULATED_TRANSCRIPT.lock().unwrap();
+                if !transcript.is_empty() {
+                    transcript.push(' ');
+                }
+                transcript.push_str(&text);
+            }
+        }
+
+        let text = {
+            let transcript = ACCUMULATED_TRANSCRIPT.lock().unwrap();
+            transcript.clone()
+        };
+
+        let (source_app, started_at) = {
+            let mut meta = AUTO_RECORD_META.lock().unwrap();
+            meta.take()
+                .unwrap_or_else(|| (app_name.clone(), chrono::Local::now()))
+        };
+
+        if text.trim().is_empty() {
+            info!("Auto-capture: nothing transcribed for {}, no file written", source_app);
+            return;
+        }
+
+        match engine::transcript_export::write_markdown(
+            &app_handle,
+            &source_app,
+            &text,
+            started_at,
+            chrono::Local::now(),
+        ) {
+            Ok(path) => info!("Auto-capture: transcript saved to {}", path.display()),
+            Err(err) => log::warn!("Auto-capture: could not write transcript: {}", err),
+        }
+
+        // The file is what other tools read, but store the transcript as a
+        // note too, otherwise the app itself cannot search or answer questions
+        // about meetings it recorded.
+        store_transcript_as_note(&app_handle, &source_app, &text, started_at);
+    });
+}
+
+/// Save a captured transcript as a document in the Unassigned project.
+fn store_transcript_as_note(
+    app_handle: &AppHandle,
+    source_app: &str,
+    text: &str,
+    started_at: chrono::DateTime<chrono::Local>,
+) {
+    let title = format!("{} - {}", source_app, started_at.format("%Y-%m-%d %H:%M"));
+    let html = format!("<p>{}</p>", html_escape(text));
+
+    let stored = app_handle.db(|db| -> Result<i64, rusqlite::Error> {
+        let project_id = ensure_unassigned_project(db)?;
+        let document_id = add_blank_document(db, project_id)?;
+        update_activity_name(db, document_id, &title)?;
+        update_activity_text(db, document_id, &html)?;
+        Ok(document_id)
+    });
+
+    match stored {
+        Ok(document_id) => info!("Auto-capture: transcript stored as document {}", document_id),
+        Err(err) => log::warn!("Auto-capture: could not store transcript as note: {}", err),
+    }
+}
+
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[tauri::command]

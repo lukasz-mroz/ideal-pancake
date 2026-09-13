@@ -16,10 +16,77 @@ const NOTIFICATION_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 /// Prevents flapping when transient mic drops happen mid-call.
 const LEAVE_GRACE_POLLS: u8 = 3;
 
+/// Windows records microphone use per application in the registry: the same
+/// data behind the "app is using your microphone" indicator. A key whose
+/// `LastUsedTimeStop` is 0 is using the microphone *right now*.
+///
+/// This is per-app, which matters: the macOS path can only ask "is the input
+/// device busy" globally and therefore has to suppress itself while Platypus
+/// records. Here we can ask about Teams specifically and keep watching it for
+/// as long as our own recording runs.
+#[cfg(target_os = "windows")]
+fn app_holding_mic(name_fragment: &str) -> bool {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    const CONSENT_STORE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
+
+    fn key_is_active(key: &winreg::RegKey) -> bool {
+        // REG_QWORD; 0 means "still in use". Absent value means never used.
+        key.get_value::<u64, _>("LastUsedTimeStop")
+            .map(|stop| stop == 0)
+            .unwrap_or(false)
+    }
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let store = match hkcu.open_subkey_with_flags(CONSENT_STORE, KEY_READ) {
+        Ok(key) => key,
+        Err(err) => {
+            debug!("Cannot read microphone consent store: {}", err);
+            return false;
+        }
+    };
+
+    let needle = name_fragment.to_ascii_lowercase();
+
+    // Packaged apps (new Teams is one) sit directly under the store, keyed by
+    // package family name. Desktop apps sit under NonPackaged, keyed by their
+    // executable path with backslashes replaced by '#'.
+    for name in store.enum_keys().flatten() {
+        if name.eq_ignore_ascii_case("NonPackaged") {
+            if let Ok(non_packaged) = store.open_subkey_with_flags(&name, KEY_READ) {
+                for exe_key in non_packaged.enum_keys().flatten() {
+                    if exe_key.to_ascii_lowercase().contains(&needle) {
+                        if let Ok(key) = non_packaged.open_subkey_with_flags(&exe_key, KEY_READ) {
+                            if key_is_active(&key) {
+                                debug!("Microphone held by {}", exe_key);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if name.to_ascii_lowercase().contains(&needle) {
+            if let Ok(key) = store.open_subkey_with_flags(&name, KEY_READ) {
+                if key_is_active(&key) {
+                    debug!("Microphone held by {}", name);
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Check if Zoom is in an active meeting.
 /// CptHost is a process that only runs during an active Zoom meeting on macOS.
 /// Important: "caphost" is a DIFFERENT process that runs whenever Zoom is open
 /// (even without a meeting) — do NOT match it, or you get false positives.
+#[cfg(not(target_os = "windows"))]
 fn is_zoom_in_meeting(system: &System) -> bool {
     for (_pid, process) in system.processes() {
         let name = process.name();
@@ -214,6 +281,7 @@ fn teams_meeting_window_title() -> Option<String> {
 /// "Teams running" alone is not enough — that's where the previous
 /// implementation got false positives. The mic-active gate matches what the
 /// macOS orange-dot indicator already shows the user.
+#[cfg(not(target_os = "windows"))]
 fn is_teams_in_meeting(system: &System) -> bool {
     if !is_external_mic_active() {
         return false;
@@ -225,6 +293,20 @@ fn is_teams_in_meeting(system: &System) -> bool {
         debug!("Teams meeting window: {}", title);
     }
     true
+}
+
+/// On Windows, "in a meeting" is simply "the app is holding the microphone".
+#[cfg(target_os = "windows")]
+fn is_zoom_in_meeting(_system: &System) -> bool {
+    app_holding_mic("zoom")
+}
+
+#[cfg(target_os = "windows")]
+fn is_teams_in_meeting(system: &System) -> bool {
+    if !is_teams_running(system) {
+        return false;
+    }
+    app_holding_mic("teams")
 }
 
 struct MeetingDetector {
@@ -247,9 +329,10 @@ impl MeetingDetector {
         }
     }
 
-    /// Poll running processes. Returns newly-detected meeting app names
-    /// (only those not already detected and not in cooldown).
-    fn poll(&mut self) -> Vec<String> {
+    /// Poll running processes. Returns (newly detected, just ended) meeting
+    /// app names. New ones are filtered by the notification cooldown; ended
+    /// ones never are, otherwise an automatic recording could be left running.
+    fn poll(&mut self) -> (Vec<String>, Vec<String>) {
         self.system.refresh_processes();
 
         let mut current_raw: HashSet<String> = HashSet::new();
@@ -291,6 +374,13 @@ impl MeetingDetector {
             .cloned()
             .collect();
 
+        // ...and the ones that just left, so an automatic recording can stop.
+        let ended_apps: Vec<String> = self
+            .previously_detected
+            .difference(&current_meeting_apps)
+            .cloned()
+            .collect();
+
         self.previously_detected = current_meeting_apps;
 
         // Filter out apps still in cooldown
@@ -313,7 +403,7 @@ impl MeetingDetector {
             self.cooldowns.insert(app.clone(), now);
         }
 
-        notifiable
+        (notifiable, ended_apps)
     }
 }
 
@@ -342,10 +432,17 @@ pub fn start_meeting_detection(app_handle: AppHandle) {
                 continue;
             }
 
-            let new_apps = detector.poll();
+            let (new_apps, ended_apps) = detector.poll();
 
             for app_name in &new_apps {
                 info!("Meeting detected on: {}", app_name);
+
+                // Silent capture: start recording without asking. The popup
+                // and banner below are skipped entirely in this mode.
+                if crate::auto_capture_enabled(&app_handle) {
+                    crate::auto_record_start(app_handle.clone(), app_name.clone());
+                    continue;
+                }
 
                 // Quiet macOS corner notification (no focus steal).
                 show_corner_notification(&app_handle, app_name);
@@ -355,6 +452,11 @@ pub fn start_meeting_detection(app_handle: AppHandle) {
                 if let Some(window) = app_handle.get_window("main") {
                     let _ = window.emit("meeting-detected", app_name.clone());
                 }
+            }
+
+            for app_name in &ended_apps {
+                info!("Meeting ended on: {}", app_name);
+                crate::auto_record_stop(app_handle.clone(), app_name.clone());
             }
 
             std::thread::sleep(Duration::from_secs(5));

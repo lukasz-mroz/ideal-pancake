@@ -94,6 +94,17 @@ try {
         if (Test-Path $source) { Copy-Item $source $stage -Force }
     }
 
+    # Stamp the build so an update can tell what is already installed.
+    $commit = (& git rev-parse --short HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $commit) { $commit = 'unknown' }
+    $flavour = if ($IncludeCudaRuntime) { 'cuda' } else { 'cpu' }
+    Set-Content -Path (Join-Path $stage 'VERSION.txt') -Encoding UTF8 -Value @(
+        "version=$version",
+        "commit=$commit",
+        "flavour=$flavour",
+        "built=$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+    )
+
     # Marker file: makes the build portable even if it was compiled without
     # the `portable` cargo feature. Delete it to fall back to %APPDATA%.
     Set-Content -Path (Join-Path $stage 'portable.txt') -Encoding UTF8 -Value @(

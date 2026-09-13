@@ -22,6 +22,10 @@ pub static PROCESSED_SAMPLE_COUNT: once_cell::sync::Lazy<Arc<std::sync::Mutex<us
     once_cell::sync::Lazy::new(|| Arc::new(std::sync::Mutex::new(0)));
 
 /// Record audio to a WAV file 
+/// Mix the speakers' output into the recording. On by default; the
+/// `capture_system_audio` setting turns it off.
+pub static CAPTURE_SYSTEM_AUDIO: AtomicBool = AtomicBool::new(true);
+
 pub fn record_audio(file_path: &str) -> Result<(), String> {
     use hound::{WavSpec, WavWriter};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -266,6 +270,12 @@ pub async fn start_recording_local() -> std::result::Result<(), String> {
 
     IS_RECORDING.store(true, Ordering::SeqCst);
 
+    // Capture what the speakers play as well, so the other side of a call
+    // ends up in the transcript instead of only our own microphone.
+    if CAPTURE_SYSTEM_AUDIO.load(Ordering::SeqCst) {
+        crate::engine::loopback_capture::start();
+    }
+
     std::thread::spawn(move || {
         if let Err(err) = record_audio_to_buffer() {
             eprintln!("Error recording audio to buffer: {}", err);
@@ -282,21 +292,52 @@ pub async fn stop_recording_local() -> std::result::Result<(), String> {
         return Err("Not recording".to_string());
     }
     IS_RECORDING.store(false, Ordering::SeqCst);
+    crate::engine::loopback_capture::stop();
     std::thread::sleep(std::time::Duration::from_millis(200));
     Ok(())
 }
 
 /// Get new (unprocessed) samples from the buffer for the realtime loop
 pub fn take_new_samples() -> Vec<f32> {
-    let buf = AUDIO_BUFFER.lock().unwrap();
-    let mut count = PROCESSED_SAMPLE_COUNT.lock().unwrap();
-    let start = *count;
-    if start >= buf.len() {
-        return Vec::new();
-    }
-    let new_samples = buf[start..].to_vec();
-    *count = buf.len();
+    let mut new_samples = {
+        let buf = AUDIO_BUFFER.lock().unwrap();
+        let mut count = PROCESSED_SAMPLE_COUNT.lock().unwrap();
+        let start = *count;
+        if start >= buf.len() {
+            return Vec::new();
+        }
+        let taken = buf[start..].to_vec();
+        *count = buf.len();
+        taken
+    };
+
+    mix_in_system_audio(&mut new_samples);
     new_samples
+}
+
+/// Sum the speaker output into the microphone samples.
+///
+/// Both streams are wall-clock driven, so they line up to within a few tens of
+/// milliseconds - far below anything speech recognition cares about. Each side
+/// is attenuated before summing so that two loud sources cannot clip.
+fn mix_in_system_audio(mic: &mut [f32]) {
+    if mic.is_empty() || !CAPTURE_SYSTEM_AUDIO.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let rate = DEVICE_SAMPLE_RATE.load(Ordering::SeqCst);
+    if rate == 0 {
+        return;
+    }
+
+    let system = crate::engine::loopback_capture::take_samples(rate, mic.len());
+    if system.is_empty() {
+        return;
+    }
+
+    for (sample, other) in mic.iter_mut().zip(system.iter()) {
+        *sample = (*sample * 0.8 + *other * 0.8).clamp(-1.0, 1.0);
+    }
 }
 
 /// Drain all remaining samples (called at stop for final processing)
