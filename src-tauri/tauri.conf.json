@@ -24,21 +24,27 @@
         "show": true
       },
       "os": {
-      "all": true
+        "all": true
       },
       "all": true,
       "fs": {
         "scope": [
           "$RESOURCE/*",
           "$APPDATA/*",
-          "$APPDATA/podcasts/*"
+          "$APPDATA/podcasts/*",
+          "$EXE/*",
+          "$EXE/**",
+          "$APPDATA/**"
         ]
       },
       "protocol": {
         "asset": true,
         "assetScope": [
           "$APPDATA/*",
-          "$APPDATA/podcasts/*"
+          "$APPDATA/podcasts/*",
+          "$APPDATA/**",
+          "$EXE/*",
+          "$EXE/**"
         ]
       }
     },

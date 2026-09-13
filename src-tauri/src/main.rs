@@ -76,6 +76,10 @@ lazy_static! {
 #[tokio::main]
 async fn main() {
     let port = 5173;
+    // Portable mode: redirect WebView2 storage next to the executable before
+    // any window exists.
+    configuration::portable::prepare_environment();
+
     let mut builder = tauri::Builder::default().plugin(tauri_plugin_oauth::init());
 
     fix_path_env::fix_all_vars().expect("Failed to load env");
@@ -215,14 +219,13 @@ async fn main() {
             }
 
             let app_handle = app.handle();
-            let _ = setup_directories::setup_dirs(
-                app_handle
-                    .path_resolver()
-                    .app_data_dir()
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
+            let app_data_dir = configuration::portable::app_data_dir_or_panic(&app_handle);
+            info!(
+                "Portable mode: {} (data dir: {})",
+                configuration::portable::is_portable(),
+                app_data_dir.display()
             );
+            let _ = setup_directories::setup_dirs(app_data_dir.to_str().unwrap());
             prerequisites::check_and_install_prerequisites(
                 app_handle
                     .path_resolver()
@@ -231,7 +234,7 @@ async fn main() {
                     .to_str()
                     .unwrap(),
             );
-            clean_up(app_handle.path_resolver().app_data_dir().unwrap());
+            clean_up(app_data_dir.clone());
             setup_keypress_listener(&app_handle);
 
             // Load meeting detection setting from DB and start the detector thread

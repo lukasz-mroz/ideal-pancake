@@ -18,10 +18,7 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 pub fn initialize_database(
     app_handle: &AppHandle,
 ) -> Result<rusqlite::Connection, Box<dyn std::error::Error>> {
-    let app_dir = app_handle
-        .path_resolver()
-        .app_data_dir()
-        .expect("The app data directory should exist.");
+    let app_dir = crate::configuration::portable::app_data_dir_or_panic(app_handle);
     fs::create_dir_all(&app_dir).expect("The app data directory should be created.");
     let sqlite_path = app_dir.join("platypus.sqlite");
     info!("SQLITE_PATH: {}", sqlite_path.display());
@@ -61,10 +58,7 @@ pub async fn get_vector_db(
 fn initialize_vector_database<'a>(
     app_handle: &AppHandle,
 ) -> Result<SimilaritySearch, Box<dyn std::error::Error>> {
-    let app_dir = app_handle
-        .path_resolver()
-        .app_data_dir()
-        .expect("The app data directory should exist.");
+    let app_dir = crate::configuration::portable::app_data_dir_or_panic(app_handle);
     let hnsw_db_path = app_dir.join("hnsw");
     let collection_name = "activity_vectors";
     let hnsw = SimilaritySearch::open(hnsw_db_path.to_str().unwrap(), collection_name)?;

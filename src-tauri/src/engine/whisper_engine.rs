@@ -55,10 +55,7 @@ fn suppress_whisper_logs() {
 }
 
 pub fn model_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("platypus_notes")
-        .join("models")
+    crate::configuration::portable::models_dir()
 }
 
 pub fn model_path(model_id: &str) -> PathBuf {

@@ -100,6 +100,17 @@ npm run tauri build
 
 For a signed + notarized macOS build that uploads to your S3 bucket, see [`scripts/build-mac.sh`](scripts/build-mac.sh) — requires Apple Developer credentials in `.env.build`.
 
+### Windows portable build
+
+A no-installer Windows build that keeps all data next to the executable — see [`docs/WINDOWS-PORTABLE.md`](docs/WINDOWS-PORTABLE.md). Build it in CI via the *Windows portable build* workflow, or locally:
+
+```powershell
+npm install
+npm run build
+cargo build --release --features "custom-protocol portable" --manifest-path src-tauri\Cargo.toml
+powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1
+```
+
 ## Architecture notes
 
 A few of the less-obvious decisions:

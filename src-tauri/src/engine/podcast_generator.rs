@@ -206,9 +206,7 @@ fn save_podcast_mp3(app_handle: &tauri::AppHandle, bytes: &[u8]) -> Result<Strin
     use std::fs;
     use tauri::Manager;
 
-    let base = app_handle
-        .path_resolver()
-        .app_data_dir()
+    let base = crate::configuration::portable::app_data_dir(app_handle)
         .ok_or_else(|| "Could not resolve app data dir".to_string())?
         .join("podcasts");
 

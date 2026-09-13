@@ -27,10 +27,7 @@ lazy_static::lazy_static! {
 
 /// Get the directory path for a project's vector index
 fn get_project_vector_path(app_handle: &AppHandle, project_id: i64) -> PathBuf {
-    let app_dir = app_handle
-        .path_resolver()
-        .app_data_dir()
-        .expect("The app data directory should exist.");
+    let app_dir = crate::configuration::portable::app_data_dir_or_panic(app_handle);
     
     app_dir.join("vectors").join(format!("project_{}", project_id))
 }

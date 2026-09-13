@@ -80,6 +80,12 @@ rdev = { git = "https://github.com/fufesou/rdev" }
 # If you use cargo directly instead of tauri's cli you can use this feature flag to switch between tauri's `dev` and `build` modes.
 custom-protocol = ["tauri/custom-protocol"]
 
+# Store all user data (database, vector indices, Whisper models, recordings)
+# in a `data` folder next to the executable instead of the OS app-data
+# directory. Used for the Windows portable build; see
+# `src/configuration/portable.rs`.
+portable = []
+
 [target."cfg(not(target_os = \"windows\"))".dependencies]
 strip-ansi-escapes = "0.2"
 

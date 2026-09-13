@@ -114,8 +114,9 @@ pub async fn start_recording() -> Result<String, String> {
         return Err("Already recording".to_string());
     }
 
-    // Create a temporary file path in the system temp directory
-    let app_data_dir = std::env::temp_dir().join("platypus_recordings");
+    // Recordings live next to the executable in portable mode, otherwise in
+    // the system temp directory.
+    let app_data_dir = crate::configuration::portable::recordings_dir();
     std::fs::create_dir_all(&app_data_dir)
         .map_err(|e| format!("Failed to create recording directory: {}", e))?;
     

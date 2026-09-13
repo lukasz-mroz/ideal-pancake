@@ -1,0 +1,105 @@
+name: Windows portable build
+
+# Builds Platypus as a portable Windows app: a folder you unzip and run, with
+# every bit of user data kept next to the executable (see
+# src-tauri/src/configuration/portable.rs).
+#
+# Run it from the Actions tab ("Run workflow"), or push a tag like v0.1.0.
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_model:
+        description: Whisper model to bundle for offline transcription
+        type: choice
+        default: large-v3-turbo
+        options:
+          - large-v3-turbo
+          - large-v3
+          - distil-large-v3.5
+          - none
+      include_webview2:
+        description: Bundle the WebView2 runtime installer (works without internet)
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    env:
+      WHISPER_MODEL: ${{ github.event.inputs.whisper_model || 'large-v3-turbo' }}
+      INCLUDE_WEBVIEW2: ${{ github.event.inputs.include_webview2 || 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # whisper-rs-sys compiles whisper.cpp with cmake and generates bindings
+      # with bindgen, which needs libclang.dll. Both ship with the runner
+      # image; install LLVM only if it is missing.
+      - name: Ensure cmake and LLVM are available
+        shell: pwsh
+        run: |
+          cmake --version
+          if (-not (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) {
+            choco install llvm -y --no-progress
+          }
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install npm dependencies
+        run: npm install --no-audit --no-fund
+
+      # `npm run build` runs tsc first; fall back to a plain vite build so a
+      # type error in unrelated code does not block a release build.
+      - name: Build frontend
+        shell: bash
+        run: npm run build || (echo "::warning::tsc failed - building with vite only" && npx vite build)
+
+      # Build the binary with cargo directly (no tauri CLI): the `portable`
+      # feature pins all data next to the executable, `custom-protocol` embeds
+      # the frontend from ../dist.
+      - name: Build Platypus (release, portable)
+        run: cargo build --release --features "custom-protocol portable" --manifest-path src-tauri/Cargo.toml
+
+      - name: Package portable bundle
+        shell: pwsh
+        run: |
+          ./scripts/package-portable.ps1 `
+            -WhisperModel "$env:WHISPER_MODEL" `
+            -IncludeWebView2 ([System.Convert]::ToBoolean("$env:INCLUDE_WEBVIEW2"))
+
+      - name: Show package contents
+        shell: pwsh
+        run: Get-ChildItem dist-portable -Recurse | Select-Object FullName, Length
+
+      # compression-level 0: the zip is already compressed, and the Whisper
+      # model does not compress further.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: platypus-portable-windows-x64
+          path: dist-portable/*.zip
+          compression-level: 0
+          retention-days: 14
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-portable/*.zip
+          fail_on_unmatched_files: false
