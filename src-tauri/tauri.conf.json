@@ -51,7 +51,7 @@
     "bundle": {
       "active": true,
       "category": "DeveloperTool",
-      "copyright": "",
+      "copyright": "Copyright (c) 2026 Platypus Notes",
       "deb": {
         "depends": []
       },
@@ -67,7 +67,7 @@
         "icons/icon.ico"
       ],
       "identifier": "com.platypusnotes.dev",
-      "longDescription": "",
+      "longDescription": "Platypus records and transcribes meetings on your own machine using a local Whisper model, and keeps the notes in a local database. Nothing leaves the computer except calls to whichever language model you choose to connect.",
       "macOS": {
         "entitlements": "macos-entitlements.plist",
         "exceptionDomain": "",
@@ -76,7 +76,7 @@
         "signingIdentity": null
       },
       "resources": [],
-      "shortDescription": "",
+      "shortDescription": "Local meeting notes and transcription",
       "targets": "all",
       "windows": {
         "certificateThumbprint": null,

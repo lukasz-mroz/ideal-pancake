@@ -310,6 +310,15 @@ recording in memory for the length of the meeting.
 
 ## Security notes
 
+- **Meeting detection polls every 12 seconds**, and each poll only lists
+  processes and reads one registry value. A tighter loop of process
+  enumeration plus registry reads is the pattern endpoint security scores as
+  snooping; twelve seconds is well below any noticeable delay in starting a
+  recording. Window titles are read only at the moment a meeting is detected,
+  never on every poll.
+- **The executable carries description and copyright metadata**, so it does not
+  look like an anonymous unsigned binary.
+
 - **API keys are encrypted at rest.** Keys for Claude, OpenAI, Gemini and
   ElevenLabs are wrapped with Windows DPAPI before they are written to
   `platypus.sqlite`, so the value is tied to the current Windows user. A

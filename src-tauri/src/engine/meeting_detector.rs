@@ -12,9 +12,17 @@ pub static MEETING_DETECTION_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Don't re-notify for the same app within this window.
 const NOTIFICATION_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 
-/// Number of consecutive "not detected" polls before we consider a meeting ended.
-/// Prevents flapping when transient mic drops happen mid-call.
-const LEAVE_GRACE_POLLS: u8 = 3;
+/// How often to check for a meeting. Each check enumerates processes and reads
+/// the microphone-consent registry key - cheap, but a tight loop of it looks,
+/// to endpoint security, like something snooping. Twelve seconds is far below
+/// anything a person would notice as a delayed start.
+const POLL_INTERVAL: Duration = Duration::from_secs(12);
+
+/// Number of consecutive "not detected" polls before we consider a meeting
+/// ended. Prevents flapping when transient mic drops happen mid-call. Two
+/// polls at the wider interval already spans enough time to ride out a blip,
+/// and keeps the stop from trailing too far past the real end of a call.
+const LEAVE_GRACE_POLLS: u8 = 2;
 
 /// Windows records microphone use per application in the registry: the same
 /// data behind the "app is using your microphone" indicator. A key whose
@@ -469,7 +477,9 @@ struct MeetingDetector {
 impl MeetingDetector {
     fn new() -> Self {
         Self {
-            system: System::new_all(),
+            // Only processes are needed; System::new_all() would also load
+            // CPU, memory and disk info on every construction.
+            system: System::new(),
             previously_detected: HashSet::new(),
             cooldowns: HashMap::new(),
             absent_counts: HashMap::new(),
@@ -622,7 +632,7 @@ pub fn start_meeting_detection(app_handle: AppHandle) {
                 crate::auto_record_stop(app_handle.clone(), app_name.clone());
             }
 
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(POLL_INTERVAL);
         }
     });
 }
